@@ -1,0 +1,13 @@
+name = "CPUMonitor"
+uuid = "fa2ace23-03b0-4def-95f5-e924d2ede3fb"
+authors = ["Ian Butterworth <i.r.butterworth@gmail.com>"]
+version = "0.1.0"
+
+[compat]
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
