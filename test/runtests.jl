@@ -1,4 +1,4 @@
-using CPUMonitor
+using ProcessMonitor
 using Test
 
 const JULIA = Base.julia_cmd()[1]
@@ -22,9 +22,9 @@ const SPIN = "println(\"READY\"); flush(stdout); while true; end"
 # Stays idle itself but spawns a spinning child; signals readiness once the child is spawned.
 const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while true; end"`, wait=false); println("READY"); flush(stdout); sleep(60)"""
 
-@testset "CPUMonitor" begin
+@testset "ProcessMonitor" begin
     @testset "_parse_cpu_time" begin
-        f = CPUMonitor._parse_cpu_time
+        f = ProcessMonitor._parse_cpu_time
         @test f("0:00.01") ≈ 0.01
         @test f("18:29.85") ≈ 1109.85
         @test f("1:02:03") ≈ 3723.0
@@ -37,9 +37,9 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             @test_throws ErrorException CPUSampler()
         end
     else
-        # Assertions are relational rather than absolute: a contended (e.g. CI) host may
-        # deny a spinner a full core, but a spinner always out-uses a sleeper and a subtree
-        # with a busy child always out-uses the idle parent alone.
+        # CPU assertions are relational rather than absolute: a contended (e.g. CI) host
+        # may deny a spinner a full core, but a spinner always out-uses a sleeper and a
+        # subtree with a busy child always out-uses the idle parent alone.
         @testset "busy out-uses idle" begin
             p, out = start_ready(SPIN)
             try
@@ -76,6 +76,70 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             finally
                 stop(p, out)
             end
+        end
+
+        @testset "cpu_time" begin
+            bare = cpu_time()
+            @test bare > 0                             # this process has done real work
+            # measured after `bare`, so it includes at least self's still-growing CPU time
+            @test cpu_time(; recursive=true) >= bare
+        end
+
+        @testset "rss" begin
+            self = rss()
+            @test self > 10_000_000                    # a Julia process is >10 MB resident
+            p, out = start_ready(IDLE_PARENT)
+            try
+                @test rss(p) > 10_000_000
+                @test rss(p; recursive=true) > rss(p)  # child's memory is added
+            finally
+                stop(p, out)
+            end
+        end
+
+        @testset "thread_count" begin
+            # BSD `ps` may lack nlwp, in which case the count is 0; require it only where
+            # the platform is known to provide it.
+            if Sys.islinux() || Sys.isapple()
+                @test thread_count() >= 1
+                p, out = start_ready(IDLE_PARENT)
+                try
+                    @test thread_count(p; recursive=true) > thread_count(p)
+                finally
+                    stop(p, out)
+                end
+            else
+                @test thread_count() >= 0
+            end
+        end
+
+        @testset "info" begin
+            i = ProcessMonitor.info(; recursive=true)
+            @test i.cpu_time > 0
+            @test i.rss > 10_000_000
+            @test i.processes >= 1
+            p, out = start_ready(IDLE_PARENT)
+            try
+                ip = ProcessMonitor.info(p; recursive=true)
+                @test ip.processes >= 2                # parent + spinning child
+                @test ip.rss > ProcessMonitor.info(p).rss
+            finally
+                stop(p, out)
+            end
+        end
+
+        @testset "missing process throws" begin
+            # Find a pid that is not in use (probe with kill signal 0 via Libc).
+            deadpid = 0
+            for cand in 60_000:-1:50_000
+                if ccall(:kill, Cint, (Cint, Cint), cand, 0) != 0
+                    deadpid = cand
+                    break
+                end
+            end
+            @test deadpid != 0
+            @test_throws ArgumentError rss(deadpid)
+            @test_throws ArgumentError ProcessMonitor.info(deadpid)
         end
     end
 end

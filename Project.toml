@@ -1,5 +1,5 @@
-name = "CPUMonitor"
-uuid = "fa2ace23-03b0-4def-95f5-e924d2ede3fb"
+name = "ProcessMonitor"
+uuid = "4131f68c-4ce9-42e2-8e2e-eec1ce550ab1"
 authors = ["Ian Butterworth <i.r.butterworth@gmail.com>"]
 version = "0.1.0"
 
