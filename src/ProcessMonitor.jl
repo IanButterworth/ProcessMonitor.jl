@@ -1,7 +1,7 @@
 module ProcessMonitor
 
 # `info` is intentionally unexported (too generic a name to claim): use ProcessMonitor.info
-export CPUSampler, cpu_percent, cpu_time, rss, thread_count
+export CPUSampler, cpu_percent, cpu_time, rss, thread_count, top
 
 """
     ProcessMonitor
@@ -33,18 +33,27 @@ struct Snapshot
     rss::Dict{Int,Int}              # resident set size, bytes
     threads::Dict{Int,Int}          # thread count
     children::Dict{Int,Vector{Int}} # ppid -> child pids
+    ppid::Dict{Int,Int}             # pid -> parent pid
+    name::Dict{Int,String}          # pid -> short command name
+    uid::Dict{Int,Int}              # pid -> owning user id
+    exe::Dict{Int,String}           # pid -> executable path (full snapshots only)
+    cmd::Dict{Int,String}           # pid -> full command line (full snapshots only)
 end
-Snapshot() = Snapshot(Dict{Int,Float64}(), Dict{Int,Int}(), Dict{Int,Int}(), Dict{Int,Vector{Int}}())
+Snapshot() = Snapshot(Dict{Int,Float64}(), Dict{Int,Int}(), Dict{Int,Int}(),
+    Dict{Int,Vector{Int}}(), Dict{Int,Int}(), Dict{Int,String}(), Dict{Int,Int}(),
+    Dict{Int,String}(), Dict{Int,String}())
 
-function _snapshot()
+# `full` additionally gathers executable paths and command lines (used by `top`); the
+# plain API skips them so samplers stay cheap.
+function _snapshot(; full::Bool = false)
     Sys.iswindows() && error("ProcessMonitor: Windows is not yet supported")
-    Sys.islinux() && return _snapshot_proc()
-    Sys.isapple() && return _snapshot_libproc()
-    return _snapshot_ps()
+    Sys.islinux() && return _snapshot_proc(full)
+    Sys.isapple() && return _snapshot_libproc(full)
+    return _snapshot_ps(full)
 end
 
 # Linux: read everything straight from /proc/<pid>/stat.
-function _snapshot_proc()
+function _snapshot_proc(full::Bool = false)
     s = Snapshot()
     hz = ccall(:sysconf, Clong, (Cint,), 2)  # _SC_CLK_TCK
     hz <= 0 && (hz = 100)
@@ -64,8 +73,9 @@ function _snapshot_proc()
         end
         # The comm field is parenthesised and may contain spaces or ')', so index the
         # numeric fields (state, ppid, ...) from after the last ')'.
+        lp = findfirst('(', stat)
         rp = findlast(')', stat)
-        rp === nothing && continue
+        (lp === nothing || rp === nothing || rp <= lp) && continue
         f = split(SubString(stat, nextind(stat, rp)))
         length(f) >= 22 || continue
         ppid = tryparse(Int, f[2])
@@ -77,7 +87,29 @@ function _snapshot_proc()
         s.cputime[pid] = (utime + stime) / hz
         nthr === nothing || (s.threads[pid] = nthr)
         rsspages === nothing || (s.rss[pid] = rsspages * pagesize)
+        s.name[pid] = String(SubString(stat, nextind(stat, lp), prevind(stat, rp)))
+        st = try
+            Base.stat("/proc/$name")
+        catch
+            nothing
+        end
+        st === nothing || (s.uid[pid] = Int(st.uid))
+        s.ppid[pid] = ppid
         push!(get!(s.children, ppid, Int[]), pid)
+        if full
+            cmdline = try
+                read("/proc/$name/cmdline", String)
+            catch
+                ""
+            end
+            isempty(cmdline) || (s.cmd[pid] = strip(replace(cmdline, '\0' => ' ')))
+            exe = try
+                readlink("/proc/$name/exe")
+            catch
+                ""  # EACCES for other users' processes
+            end
+            isempty(exe) || (s.exe[pid] = exe)
+        end
     end
     return s
 end
@@ -87,7 +119,7 @@ end
 # (converted with mach_timebase); proc_pidinfo(PROC_PIDTASKINFO) yields resident size and
 # thread count, and proc_pidinfo(PROC_PIDTBSDINFO) the parent pid. These only succeed for
 # own-uid processes, which is all we need.
-function _snapshot_libproc()
+function _snapshot_libproc(full::Bool = false)
     s = Snapshot()
     tb = Ref((UInt32(0), UInt32(0)))
     ccall(:mach_timebase_info, Cint, (Ptr{Cvoid},), tb) == 0 || return s
@@ -100,7 +132,9 @@ function _snapshot_libproc()
     got = ccall(:proc_listallpids, Cint, (Ptr{Cint}, Cint), pids, sizeof(Cint) * length(pids))
     rb = Ref(ntuple(_ -> UInt64(0), 16))  # rusage_info_v0: uuid[16B], ri_user_time, ri_system_time, ...
     ti = Ref(ntuple(_ -> UInt64(0), 16))  # proc_taskinfo: virtual, resident, 4 more u64s, then int32s
-    bi = Ref(ntuple(_ -> UInt32(0), 40))  # proc_bsdinfo: pbi_ppid is the 5th uint32
+    bi = Ref(ntuple(_ -> UInt32(0), 40))  # proc_bsdinfo: pbi_pid, pbi_ppid, pbi_uid are the 4th-6th uint32s
+    nb = zeros(UInt8, 64)
+    pb = zeros(UInt8, 4096)
     for i in 1:min(got, length(pids))
         pid = Int(pids[i])
         pid > 0 || continue
@@ -114,19 +148,62 @@ function _snapshot_libproc()
             s.threads[pid] = Int(t[11] >> 32)   # pti_threadnum: 10th int32 after 6 uint64s
         end
         if ccall(:proc_pidinfo, Cint, (Cint, Cint, UInt64, Ptr{Cvoid}, Cint), pid, 3, 0, bi, 160) > 0
-            push!(get!(s.children, Int(bi[][5]), Int[]), pid)
+            b = bi[]
+            s.ppid[pid] = Int(b[5])
+            s.uid[pid] = Int(b[6])
+            push!(get!(s.children, Int(b[5]), Int[]), pid)
+        end
+        n = ccall(:proc_name, Cint, (Cint, Ptr{UInt8}, UInt32), pid, nb, length(nb))
+        n > 0 && (s.name[pid] = String(nb[1:n]))
+        if full
+            n = ccall(:proc_pidpath, Cint, (Cint, Ptr{UInt8}, UInt32), pid, pb, length(pb))
+            n > 0 && (s.exe[pid] = String(pb[1:n]))
+            args = _procargs_apple(pid)
+            isempty(args) || (s.cmd[pid] = join(args, ' '))
         end
     end
     return s
 end
 
+# macOS: recover a process's argv via sysctl KERN_PROCARGS2 (own-uid processes only).
+# The buffer holds an int32 argc, the exec path, NUL padding, then argc NUL-separated args.
+function _procargs_apple(pid::Int)
+    mib = Cint[1, 49, pid]  # CTL_KERN, KERN_PROCARGS2, pid
+    sz = Ref{Csize_t}(0)
+    ccall(:sysctl, Cint, (Ptr{Cint}, Cuint, Ptr{Cvoid}, Ptr{Csize_t}, Ptr{Cvoid}, Csize_t),
+        mib, 3, C_NULL, sz, C_NULL, 0) == 0 || return String[]
+    buf = zeros(UInt8, sz[])
+    ccall(:sysctl, Cint, (Ptr{Cint}, Cuint, Ptr{Cvoid}, Ptr{Csize_t}, Ptr{Cvoid}, Csize_t),
+        mib, 3, buf, sz, C_NULL, 0) == 0 || return String[]
+    length(buf) >= 4 || return String[]
+    argc = reinterpret(Int32, buf[1:4])[1]
+    i = 5
+    while i <= length(buf) && buf[i] != 0x00; i += 1; end  # exec path
+    while i <= length(buf) && buf[i] == 0x00; i += 1; end  # padding
+    args = String[]
+    for _ in 1:argc
+        j = i
+        while j <= length(buf) && buf[j] != 0x00; j += 1; end
+        j > i && push!(args, String(buf[i:j-1]))
+        i = j + 1
+        i > length(buf) && break
+    end
+    return args
+end
+
 # BSD: one `ps` snapshot of the full process table. `nlwp` (thread count) is not
-# universally supported, so fall back to a query without it.
-function _snapshot_ps()
+# universally supported, so fall back to a query without it. `comm` is requested last so
+# names containing spaces can be reassembled from the remaining fields.
+function _snapshot_ps(full::Bool = false)
     s = Snapshot()
     # Separate `-o` flags (not `-o pid=,ppid=,...`): some BSD `ps` treat the text after
-    # the first `=` as a header, collapsing the output to one column.
-    for cols in (`-o pid= -o ppid= -o time= -o rss= -o nlwp=`, `-o pid= -o ppid= -o time= -o rss=`)
+    # the first `=` as a header, collapsing the output to one column. Full snapshots
+    # request `args` (the whole command line) instead of `comm`.
+    lastcol(full) = full ? `-o args=` : `-o comm=`
+    for (nnum, cols) in (
+        (6, `-o pid= -o ppid= -o time= -o rss= -o uid= -o nlwp= $(lastcol(full))`),
+        (5, `-o pid= -o ppid= -o time= -o rss= -o uid= $(lastcol(full))`),
+    )
         raw = try
             read(`ps -A $cols`, String)
         catch
@@ -134,19 +211,33 @@ function _snapshot_ps()
         end
         for line in eachline(IOBuffer(raw))
             f = split(line)
-            length(f) >= 4 || continue
+            length(f) >= nnum || continue
             pid = tryparse(Int, f[1])
             ppid = tryparse(Int, f[2])
             secs = _parse_cpu_time(f[3])
             rsskb = tryparse(Int, f[4])
+            uid = tryparse(Int, f[5])
             (pid === nothing || ppid === nothing || secs === nothing) && continue
             pid > 0 || continue  # e.g. the FreeBSD kernel is pid 0, its own parent
             s.cputime[pid] = secs
             rsskb === nothing || (s.rss[pid] = rsskb * 1024)
-            if length(f) >= 5
-                nthr = tryparse(Int, f[5])
+            uid === nothing || (s.uid[pid] = uid)
+            if nnum == 6
+                nthr = tryparse(Int, f[6])
                 nthr === nothing || (s.threads[pid] = nthr)
             end
+            if length(f) > nnum
+                rest = join(f[nnum+1:end], ' ')
+                if full
+                    s.cmd[pid] = rest
+                    exe = first(split(rest, ' '))
+                    s.exe[pid] = exe
+                    s.name[pid] = basename(exe)
+                else
+                    s.name[pid] = basename(rest)
+                end
+            end
+            s.ppid[pid] = ppid
             push!(get!(s.children, ppid, Int[]), pid)
         end
         isempty(s.cputime) || break
@@ -327,5 +418,7 @@ end
 for f in (:cpu_time, :rss, :thread_count, :info)
     @eval $f(p::Base.Process; recursive::Bool = false) = $f(getpid(p); recursive)
 end
+
+include("top.jl")
 
 end # module

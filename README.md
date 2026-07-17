@@ -1,7 +1,8 @@
 # ProcessMonitor.jl
 
 Measure resource use of a process in Julia — CPU utilization, memory (RSS), and thread
-count — optionally including the subprocesses it spawns.
+count — optionally including the subprocesses it spawns. Includes `top()`, an interactive
+`htop`-like terminal view built on the same machinery.
 
 Process information is read without spawning a subprocess: from `/proc` on Linux (so it
 works in minimal containers) and via libproc syscalls on macOS (so it works under sandboxes
@@ -61,6 +62,45 @@ p = run(`some_program`, wait=false)
 cpu_percent(p; interval=1.0)
 rss(p; recursive=true)
 ```
+
+## Interactive system view
+
+```julia
+julia> top()
+```
+
+```
+ ProcessMonitor  mymac.local  up 3d 22:58  load 4.34 3.77 3.54  10 cores  458 procs  3304 thr
+ CPU ▕█████▅              ▏ 28.4% ▃▄▆█▅▃▂▂▃▄▅▆▅▄▃▂
+ MEM ▕█████████████▆      ▏ 68.5% ▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆   11G/16G
+ cores ▃▃▃▃▂▂▁▅▃▂   julia: 3 procs  196%  1.4G  36 thr
+    PID USER      NAME                             THR     RSS     TIME    CPU%▾
+  82676 ian       julia 1.12.6                      27    830M     0:10    96.4
+  82707 ian       └─julia 1.10.11                   18    451M     0:06    95.6
+  ...
+```
+
+An `htop`-like view with some things `htop` doesn't have:
+
+- **Tree view with subtree rollup** (`T`, then `a`): each parent's row can show the CPU%,
+  RSS and thread count of its whole process subtree — the "who is really using the CPU"
+  question that flat per-process views can't answer.
+- **Julia-aware**: Julia processes are highlighted and labeled with their version (read
+  from the juliaup/app install path; in-tree builds show `dev`); a header rollup totals
+  Julia's CPU, memory and threads across the machine; `j` filters to Julia processes only.
+  Handy for watching a test suite, `Distributed` workers, or precompilation fan-out.
+- **Scrolling history sparklines** for system CPU and memory, plus a per-core mini-bar row.
+- **Honest memory accounting**: active+wired+compressed on macOS (what Activity Monitor
+  reports), `MemAvailable`-based on Linux — not the misleading `total - free`.
+- **Interval-accurate CPU%** from cumulative CPU-time differencing (the same portable
+  method as the API), not a decaying average.
+
+Keys: `c`/`m`/`t`/`p`/`n` sort · `T` tree · `a` Σ rollup · `j` julia-only · `C` command
+lines · `/` filter · `u` mine-only · `↑`/`↓` select · `k`/`K` SIGTERM/SIGKILL · `+`/`-`
+interval · `space` pause · `q` quit.
+
+`top(io)` renders a single non-interactive frame to any `IO` (for logging or CI
+diagnostics); `top(io; tree=true)` for the tree form.
 
 ## Notes
 

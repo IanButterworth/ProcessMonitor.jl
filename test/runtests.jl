@@ -49,6 +49,7 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
     if Sys.iswindows()
         @testset "windows unsupported" begin
             @test_throws ErrorException CPUSampler()
+            @test_throws ErrorException top(IOBuffer())
         end
     else
         # CPU assertions are relational rather than absolute: a contended (e.g. CI) host
@@ -140,6 +141,64 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             finally
                 stop(p, out)
             end
+        end
+
+        @testset "top single frame" begin
+            io = IOBuffer()
+            n = top(io; interval=0.5)
+            s = String(take!(io))
+            @test n > 1
+            @test occursin("ProcessMonitor", s)
+            @test occursin("PID", s)
+            @test occursin(string(getpid()), s)   # our own row is present
+            @test occursin("CPU", s) && occursin("MEM", s)
+            @test !occursin('\e', s)              # color=false → no escape codes
+
+            # tree mode nests our spawned child under its parent
+            p, out = start_ready(IDLE_PARENT)
+            try
+                iot = IOBuffer()
+                top(iot; interval=0.5, tree=true)
+                st = String(take!(iot))
+                @test occursin("└─", st) || occursin("├─", st)
+            finally
+                stop(p, out)
+            end
+        end
+
+        @testset "julia awareness" begin
+            # the test process is itself Julia, so full snapshots must know about it
+            snap = ProcessMonitor._snapshot(full=true)
+            self = getpid()
+            @test ProcessMonitor._isjulia(snap, self)
+            @test occursin("julia", lowercase(get(snap.exe, self, "")))
+            @test occursin("--startup-file=no", get(snap.cmd, self, ""))
+
+            # the header rollup and version-labeled row appear in a frame
+            io = IOBuffer()
+            top(io; interval=0.5)
+            s = String(take!(io))
+            @test occursin("julia:", s)   # "julia: N procs ..." rollup
+
+            f = ProcessMonitor._julia_version_from_path
+            @test f("/x/.julia/juliaup/julia-1.12.6+0.aarch64/bin/julia") == "1.12.6"
+            @test f("/Applications/Julia-1.11.app/Contents/julia") == "1.11"
+            @test f("/home/x/julia/usr/bin/julia") == "dev"
+            @test f("/usr/bin/vim") == ""
+
+            # a cheap plain snapshot skips exe/cmd
+            lean = ProcessMonitor._snapshot()
+            @test isempty(lean.exe) && isempty(lean.cmd)
+        end
+
+        @testset "formatting helpers" begin
+            @test ProcessMonitor._fmtbytes(1 << 30) == "1.0G"
+            @test ProcessMonitor._fmtbytes(15 * (1 << 20)) == "15M"
+            @test ProcessMonitor._fmtbytes(512) == "512"
+            @test ProcessMonitor._fmttime(65) == "1:05"
+            @test ProcessMonitor._fmttime(3665) == "1:01:05"
+            @test ProcessMonitor._fmtuptime(90061) == "1d 1:01"
+            @test length(ProcessMonitor._spark([0.5, 1.0], 4)) >= 4
         end
 
         @testset "missing process throws" begin
