@@ -243,10 +243,17 @@ function _julia_version_from_path(exe::AbstractString)
     return ""
 end
 
-# What a Julia process is doing, from its command line.
-_julia_role(cmd::AbstractString) =
-    occursin("--worker", cmd) ? "worker" :
-    occursin(r"--output-ji|Precompilation|precompilepkgs", cmd) ? "precompile" : ""
+# What a Julia process is doing, from its command line. Precompilation workers name the
+# package in their --output-ji cache path (…/compiled/v1.12/StaticArrays/jl_…), so surface
+# it: "precompile StaticArrays".
+function _julia_role(cmd::AbstractString)
+    occursin("--worker", cmd) && return "worker"
+    if occursin("--output-ji", cmd) || occursin(r"Precompilation|precompilepkgs", cmd)
+        m = match(r"compiled/v[\d.]+/([^/]+)", cmd)
+        return m === nothing ? "precompile" : "precompile " * m[1]
+    end
+    return ""
+end
 
 # The active project from --project, shortened to its basename.
 function _julia_project(cmd::AbstractString)
@@ -388,7 +395,31 @@ function _fdcount(pid::Int)
     return -1
 end
 
-function _detail_lines(fr::Frame, r::Row, width::Int)
+# Wrap `label * text` to `width` columns, indenting continuation lines under the label so
+# a long value stays fully readable across several rows.
+function _wrap(label::AbstractString, text::AbstractString, width::Int)
+    width = max(width, 16)
+    indent = repeat(' ', min(length(label), width - 8))
+    chars = collect(label * text)
+    out = String[]
+    i, firstline = 1, true
+    while i <= length(chars)
+        cap = max(firstline ? width : width - length(indent), 1)
+        j = min(i + cap - 1, length(chars))
+        push!(out, (firstline ? "" : indent) * String(chars[i:j]))
+        i, firstline = j + 1, false
+    end
+    isempty(out) && push!(out, String(label))
+    return out
+end
+
+# Drop argv[0] (the executable, shown on its own line) from a command line.
+function _strip_argv0(cmd::AbstractString)
+    sp = findfirst(' ', cmd)
+    return sp === nothing ? "" : lstrip(cmd[nextind(cmd, sp):end])
+end
+
+function _detail_lines(fr::Frame, r::Row, width::Int, maxlines::Int)
     snap = fr.snap
     started = r.age >= 0 ?
         string(Libc.strftime("%b %d %H:%M:%S", time() - r.age), " (", _fmtage(r.age), " ago)") : "?"
@@ -399,17 +430,24 @@ function _detail_lines(fr::Frame, r::Row, width::Int)
     jl = r.isjulia ? string("  julia ", r.ver,
         isempty(r.role) ? "" : "  role $(r.role)",
         isempty(r.project) ? "" : "  project $(r.project)") : ""
-    lines = String[
-        string("pid ", r.pid, "  ", r.name, "  state ", r.state,
-            "  user ", r.uid < 0 ? "?" : _username(r.uid), jl),
-        string("cmd  ", isempty(r.cmd) ? "?" : r.cmd),
-        string("exe  ", get(snap.exe, r.pid, "?"), isempty(cwd) ? "" : "  cwd $cwd"),
-        string("started ", started, "  parent ", parent),
-        string("threads ", r.threads, "  rss ", _fmtbytes(r.rss),
-            "  cpu ", @sprintf("%.1f%%", r.cpu), "  cputime ", _fmttime(r.time),
-            fds >= 0 ? "  fds $fds" : ""),
-    ]
-    return [_ellipsize(" " * l, width) for l in lines]
+    exe = get(snap.exe, r.pid, "")
+    args = _strip_argv0(r.cmd)
+    lines = String[]
+    # exe first, then cmd (with the exe stripped) — both wrapped so they are fully visible
+    append!(lines, _wrap(" exe  ", isempty(exe) ? "?" : exe, width))
+    append!(lines, _wrap(" cmd  ", isempty(args) ? "(no arguments)" : args, width))
+    push!(lines, _ellipsize(string(" pid ", r.pid, "  ", r.name, "  state ", r.state,
+        "  user ", r.uid < 0 ? "?" : _username(r.uid), jl), width))
+    push!(lines, _ellipsize(string(" started ", started, "  parent ", parent,
+        isempty(cwd) ? "" : "  cwd $cwd"), width))
+    push!(lines, _ellipsize(string(" threads ", r.threads, "  rss ", _fmtbytes(r.rss),
+        "  cpu ", @sprintf("%.1f%%", r.cpu), "  cputime ", _fmttime(r.time),
+        fds >= 0 ? "  fds $fds" : ""), width))
+    if length(lines) > maxlines
+        lines = lines[1:max(maxlines - 1, 1)]
+        push!(lines, _ellipsize(" …", width))
+    end
+    return lines
 end
 
 const _HELP = """
@@ -500,10 +538,16 @@ function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, colo
         c("\e[0m"), eol)
 
     rows = _rows(st, fr)
-    detailh = st.detail ? 6 : 0
-    # Interactive mode fits the terminal; a single-frame dump includes every row.
-    nbody = interactive ? height - 7 - detailh : length(rows)
     st.sel = clamp(st.sel, 1, max(length(rows), 1))
+    # The detail pane wraps exe/cmd, so its height is dynamic; compute it before the body
+    # so the process list gets the remaining rows. Cap it at half the screen.
+    detaillines = String[]
+    if interactive && st.detail && 1 <= st.sel <= length(rows)
+        detaillines = _detail_lines(fr, rows[st.sel], width, max(height ÷ 2, 6))
+    end
+    detailh = isempty(detaillines) ? 0 : length(detaillines) + 1  # +1 separator
+    # Interactive mode fits the terminal; a single-frame dump includes every row.
+    nbody = interactive ? max(height - 7 - detailh, 1) : length(rows)
     st.scroll = clamp(st.scroll, 0, max(length(rows) - nbody, 0))
     if st.sel <= st.scroll
         st.scroll = st.sel - 1
@@ -561,14 +605,10 @@ function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, colo
     end
 
     if interactive
-        if st.detail && 1 <= st.sel <= length(rows)
+        if !isempty(detaillines)
             print(buf, c("\e[2m"), repeat('─', width), c("\e[0m"), eol)
-            for l in _detail_lines(fr, rows[st.sel], width)
+            for l in detaillines
                 print(buf, c("\e[2m"), l, c("\e[0m"), eol)
-            end
-        elseif st.detail
-            for _ in 1:6
-                print(buf, eol)
             end
         end
         # footer

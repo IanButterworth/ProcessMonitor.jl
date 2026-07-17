@@ -211,6 +211,9 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
 
             @test ProcessMonitor._julia_role("julia --worker=abc") == "worker"
             @test ProcessMonitor._julia_role("julia --output-ji /x.ji") == "precompile"
+            @test ProcessMonitor._julia_role(
+                "julia --output-ji /Users/x/.julia/compiled/v1.12/StaticArrays/jl_U1.ji") ==
+                "precompile StaticArrays"
             @test ProcessMonitor._julia_role("julia script.jl") == ""
             @test ProcessMonitor._julia_project("julia --project=/x/MyPkg -e 1") == "MyPkg"
             @test ProcessMonitor._julia_project("julia --project -e 1") == "@."
@@ -242,6 +245,25 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             @test any(l -> any(ch -> '⠀' <= ch <= '⣿', l), g)
             b2 = ProcessMonitor._bar2(0.3, 0.2, 10; color=false)
             @test length(b2) == 10
+
+            w = ProcessMonitor._wrap(" cmd  ", repeat("x", 200), 40)
+            @test length(w) > 1                       # wrapped across rows
+            @test all(l -> length(l) <= 40, w)        # each row fits
+            @test startswith(w[2], "      ")          # continuation indented under label
+            @test ProcessMonitor._strip_argv0("/bin/julia --project=X -e 1") == "--project=X -e 1"
+            @test ProcessMonitor._strip_argv0("solo") == ""
+
+            # detail pane: exe line precedes cmd line, cmd has argv0 removed
+            snap = ProcessMonitor._snapshot(full=true)
+            st = ProcessMonitor.TopState(); st.detail = true
+            prev = snap; pc = Sys.cpu_info(); t0 = time(); sleep(0.3)
+            fr = ProcessMonitor._frame(prev, ProcessMonitor._snapshot(full=true), pc, Sys.cpu_info(), time()-t0)
+            rows = ProcessMonitor._rows(st, fr)
+            idx = findfirst(r -> r.pid == getpid(), rows)
+            dl = ProcessMonitor._detail_lines(fr, rows[idx], 60, 20)
+            iexe = findfirst(l -> occursin("exe ", l), dl)
+            icmd = findfirst(l -> occursin("cmd ", l), dl)
+            @test iexe !== nothing && icmd !== nothing && iexe < icmd
         end
 
         @testset "key decoding" begin
