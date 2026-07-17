@@ -16,18 +16,41 @@ end
 
 # Kill the process and any subprocesses it spawned (killing only the parent would orphan
 # e.g. IDLE_PARENT's spinning child), using the package's own process-tree snapshot.
+# The root pid must be captured before wait(): getpid(p) can throw once p has exited.
 function stop(p, out)
-    pids = try
-        ProcessMonitor._tree(ProcessMonitor._snapshot(), getpid(p), true)
+    rootpid = try
+        Int(getpid(p))
+    catch
+        0
+    end
+    pids = rootpid == 0 ? Int[] : try
+        ProcessMonitor._tree(ProcessMonitor._snapshot(), rootpid, true)
     catch
         Int[]
     end
     kill(p); wait(p)
     for pid in pids
-        pid == getpid(p) && continue
+        pid == rootpid && continue
         ccall(:kill, Cint, (Cint, Cint), pid, 9)  # SIGKILL any orphaned descendants
     end
     close(out)
+end
+
+# Safety net at exit: descendants orphaned by a mid-test failure reparent to init and
+# leave our subtree, so find them by their unmistakable command line instead.
+atexit() do
+    snap = try
+        ProcessMonitor._snapshot(full=true)
+    catch
+        return
+    end
+    for (pid, cmd) in snap.cmd
+        pid == getpid() && continue
+        if occursin("--startup-file=no -e while true; end", cmd) ||
+           (occursin("while true; end", cmd) && occursin("--startup-file=no", cmd))
+            ccall(:kill, Cint, (Cint, Cint), pid, 9)
+        end
+    end
 end
 
 # Spins on the CPU forever; signals readiness once spinning.
@@ -186,6 +209,17 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             @test f("/home/x/julia/usr/bin/julia") == "dev"
             @test f("/usr/bin/vim") == ""
 
+            @test ProcessMonitor._julia_role("julia --worker=abc") == "worker"
+            @test ProcessMonitor._julia_role("julia --output-ji /x.ji") == "precompile"
+            @test ProcessMonitor._julia_role("julia script.jl") == ""
+            @test ProcessMonitor._julia_project("julia --project=/x/MyPkg -e 1") == "MyPkg"
+            @test ProcessMonitor._julia_project("julia --project -e 1") == "@."
+            @test ProcessMonitor._julia_project("julia -e 1") == ""
+
+            # start time and state are captured for ourselves
+            @test 0 < time() - get(snap.start, self, 0.0) < Sys.uptime() + 60
+            @test get(snap.state, self, ' ') in ('R', 'S', 'I')
+
             # a cheap plain snapshot skips exe/cmd
             lean = ProcessMonitor._snapshot()
             @test isempty(lean.exe) && isempty(lean.cmd)
@@ -199,6 +233,40 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             @test ProcessMonitor._fmttime(3665) == "1:01:05"
             @test ProcessMonitor._fmtuptime(90061) == "1d 1:01"
             @test length(ProcessMonitor._spark([0.5, 1.0], 4)) >= 4
+            @test ProcessMonitor._fmtage(45) == "45s"
+            @test ProcessMonitor._fmtage(600) == "10m"
+            @test ProcessMonitor._fmtage(7200) == "2.0h"
+            @test ProcessMonitor._fmtage(200000) == "2.3d"
+            g = ProcessMonitor._braille([0.1, 0.5, 0.9, 1.0], 4, 2; color=false)
+            @test length(g) == 2 && all(l -> length(l) == 4, g)
+            @test any(l -> any(ch -> '⠀' <= ch <= '⣿', l), g)
+            b2 = ProcessMonitor._bar2(0.3, 0.2, 10; color=false)
+            @test length(b2) == 10
+        end
+
+        @testset "key decoding" begin
+            # CSI-u (modifyOtherKeys) sends shift+T as "\e[116;2u" — code of the
+            # UNSHIFTED key plus a shift modifier. It must decode to 'T' (tree toggle),
+            # not 't' (sort by time).
+            st = ProcessMonitor.TopState()
+            q = collect(codeunits("\e[116;2u"))
+            ProcessMonitor._drain_keys!(st, q, nothing)
+            @test st.tree
+            @test st.sortkey === :cpu       # unchanged
+            # plain bytes still work
+            ProcessMonitor._drain_keys!(st, collect(codeunits("t")), nothing)
+            @test st.sortkey === :time
+            ProcessMonitor._drain_keys!(st, collect(codeunits("T")), nothing)
+            @test !st.tree
+            # arrows: CSI and SS3 forms move the selection
+            st.sel = 5
+            ProcessMonitor._drain_keys!(st, collect(codeunits("\e[A")), nothing)
+            @test st.sel == 4
+            ProcessMonitor._drain_keys!(st, collect(codeunits("\eOB")), nothing)
+            @test st.sel == 5
+            # CSI-u enter toggles the detail pane
+            ProcessMonitor._drain_keys!(st, collect(codeunits("\e[13;1u")), nothing)
+            @test st.detail
         end
 
         @testset "missing process throws" begin

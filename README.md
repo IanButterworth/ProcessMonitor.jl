@@ -82,21 +82,29 @@ julia> top()
 
 An `htop`-like view with some things `htop` doesn't have:
 
-- **Tree view with subtree rollup** (`T`, then `a`): each parent's row can show the CPU%,
-  RSS and thread count of its whole process subtree — the "who is really using the CPU"
-  question that flat per-process views can't answer.
-- **Julia-aware**: Julia processes are highlighted and labeled with their version (read
-  from the juliaup/app install path; in-tree builds show `dev`); a header rollup totals
-  Julia's CPU, memory and threads across the machine; `j` filters to Julia processes only.
-  Handy for watching a test suite, `Distributed` workers, or precompilation fan-out.
-- **Scrolling history sparklines** for system CPU and memory, plus a per-core mini-bar row.
+- **Tree view sorted by subtree** (`T`): trees are ordered by their whole subtree's usage,
+  so "sort by CPU" surfaces the busiest tree even when its root is an idle shell; `a`
+  additionally rolls each subtree's CPU/RSS/threads up into its parent's row — the "who is
+  really using the CPU" question flat per-process views can't answer.
+- **Julia-aware**: Julia processes are highlighted and labeled with their version (from
+  the juliaup/app install path; in-tree builds show `dev`), role (`worker`,
+  `precompile`) and `--project`; a header rollup totals Julia's CPU, memory and threads
+  across the machine; `j` filters to Julia processes only; and `P` asks a Julia process
+  to print a one-shot profile to its stderr (`SIGUSR1`/`SIGINFO`). Handy for watching a
+  test suite, `Distributed` workers, or precompilation fan-out.
+- **Braille history graphs** for system CPU and memory, per-process CPU sparklines on wide
+  terminals, a per-core mini-bar row, and user/sys split CPU bars.
+- **Process age and state columns** — sort by newest (`s`) to catch spawn storms; zombies
+  and uninterruptible-sleep processes are color-coded.
+- **Detail pane** (`enter`): full command line, executable, start time, parent, fd count.
 - **Honest memory accounting**: active+wired+compressed on macOS (what Activity Monitor
   reports), `MemAvailable`-based on Linux — not the misleading `total - free`.
 - **Interval-accurate CPU%** from cumulative CPU-time differencing (the same portable
   method as the API), not a decaying average.
 
-Keys: `c`/`m`/`t`/`p`/`n` sort · `T` tree · `a` Σ rollup · `j` julia-only · `C` command
-lines · `/` filter · `u` mine-only · `↑`/`↓` select · `k`/`K` SIGTERM/SIGKILL · `+`/`-`
+Keys (`?` shows this in-app): `c`/`m`/`t`/`p`/`n`/`s` sort · `T` tree · `a` Σ rollup ·
+`j` julia-only · `C` command lines · `/` filter · `u` mine-only · `↑`/`↓` select ·
+`enter` detail · `k`/`K` SIGTERM/SIGKILL (with confirmation) · `P` profile · `+`/`-`
 interval · `space` pause · `q` quit.
 
 `top(io)` renders a single non-interactive frame to any `IO` (for logging or CI

@@ -4,34 +4,40 @@ import REPL
 using Printf: @sprintf
 
 const SPARK = ('▁', '▂', '▃', '▄', '▅', '▆', '▇', '█')
-const HIST_LEN = 120
+const HIST_LEN = 240
 
-mutable struct TopState
-    sortkey::Symbol        # :cpu, :mem, :pid, :time, :threads, :name
-    rev::Bool              # true = descending (the default for usage columns)
-    tree::Bool
-    aggregate::Bool        # tree mode: roll subtree usage up into each row
-    mine::Bool             # only this uid's processes
-    juliaonly::Bool        # only Julia processes
-    showcmd::Bool          # show full command lines instead of names
-    filter::String
-    filtering::Bool        # currently typing into the filter
-    sel::Int               # selected row (1-based, into visible rows)
-    scroll::Int
-    paused::Bool
-    interval::Float64
-    running::Bool
-    cpuhist::Vector{Float64}
-    memhist::Vector{Float64}
-    message::String        # transient status line (e.g. after a kill)
+Base.@kwdef mutable struct TopState
+    sortkey::Symbol = :cpu   # :cpu, :mem, :pid, :time, :threads, :name, :age
+    rev::Bool = true         # true = descending (the default for usage columns)
+    tree::Bool = false
+    aggregate::Bool = true   # tree mode: roll subtree usage up into each row, so the
+                             # displayed values match the busiest-subtree-first ordering
+    mine::Bool = false       # only this uid's processes
+    juliaonly::Bool = false  # only Julia processes
+    showcmd::Bool = false    # show full command lines instead of names
+    filter::String = ""
+    filtering::Bool = false  # currently typing into the filter
+    sel::Int = 1             # selected row (1-based, into visible rows)
+    scroll::Int = 0
+    paused::Bool = false
+    detail::Bool = false     # show the detail pane for the selection
+    help::Bool = false       # show the help overlay
+    pendpid::Int = 0         # pending kill confirmation target (0 = none)
+    pendsig::Int = 0
+    interval::Float64 = 2.0
+    running::Bool = true
+    cpuhist::Vector{Float64} = Float64[]
+    memhist::Vector{Float64} = Float64[]
+    pidhist::Dict{Int,Vector{Float64}} = Dict{Int,Vector{Float64}}()
+    message::String = ""     # transient status line (e.g. after a kill)
 end
-TopState(; interval = 2.0, tree = false) = TopState(:cpu, true, tree, false, false, false,
-    false, "", false, 1, 0, false, interval, true, Float64[], Float64[], "")
 
 struct Frame
     snap::Snapshot
     cpupct::Dict{Int,Float64}   # per-pid CPU% over the interval
     percore::Vector{Float64}    # per-core busy fraction 0..1
+    fuser::Float64              # system-wide user-time fraction 0..1
+    fsys::Float64               # system-wide sys-time fraction 0..1
     loadavg::NTuple{3,Float64}
     uptime::Float64
     memtotal::Int
@@ -40,8 +46,9 @@ struct Frame
     nthreads::Int
 end
 
-_cpu_busy_idle(c) = (
-    getfield(c, Symbol("cpu_times!user")) + getfield(c, Symbol("cpu_times!nice")) +
+# (user-ish, sys-ish, idle) tick totals for one core
+_cpu_uis(c) = (
+    getfield(c, Symbol("cpu_times!user")) + getfield(c, Symbol("cpu_times!nice")),
     getfield(c, Symbol("cpu_times!sys")) + getfield(c, Symbol("cpu_times!irq")),
     getfield(c, Symbol("cpu_times!idle")))
 
@@ -52,15 +59,21 @@ function _frame(prev::Snapshot, snap::Snapshot, prevcores, cores, dt::Float64)
         cpupct[pid] = 100 * max(d, 0.0) / dt
     end
     percore = Float64[]
+    du = ds = di = 0
     for i in 1:min(length(cores), length(prevcores))
-        b1, i1 = _cpu_busy_idle(prevcores[i])
-        b2, i2 = _cpu_busy_idle(cores[i])
-        db, di = b2 - b1, i2 - i1
-        push!(percore, db + di > 0 ? db / (db + di) : 0.0)
+        u1, s1, i1 = _cpu_uis(prevcores[i])
+        u2, s2, i2 = _cpu_uis(cores[i])
+        cu, cs, ci = u2 - u1, s2 - s1, i2 - i1
+        du += cu; ds += cs; di += ci
+        tot = cu + cs + ci
+        push!(percore, tot > 0 ? (cu + cs) / tot : 0.0)
     end
+    tot = du + ds + di
     la = Sys.loadavg()
     memtotal = Int(Sys.total_memory())
-    return Frame(snap, cpupct, percore, (la[1], la[2], la[3]), Sys.uptime(),
+    return Frame(snap, cpupct, percore,
+        tot > 0 ? du / tot : 0.0, tot > 0 ? ds / tot : 0.0,
+        (la[1], la[2], la[3]), Sys.uptime(),
         memtotal, _mem_used(memtotal), length(snap.cputime), sum(values(snap.threads); init = 0))
 end
 
@@ -121,6 +134,14 @@ function _fmtuptime(secs::Real)
     return d > 0 ? @sprintf("%dd %d:%02d", d, h, m) : @sprintf("%d:%02d", h, m)
 end
 
+function _fmtage(secs::Real)
+    secs < 0 && return "?"
+    secs < 100 && return @sprintf("%ds", secs)
+    secs < 6000 && return @sprintf("%dm", secs ÷ 60)
+    secs < 172800 && return @sprintf("%.1fh", secs / 3600)
+    return @sprintf("%.1fd", secs / 86400)
+end
+
 _pctcolor(f) = f < 0.60 ? "\e[32m" : f < 0.85 ? "\e[33m" : "\e[31m"
 
 function _bar(frac::Float64, width::Int; color::Bool = true)
@@ -132,6 +153,16 @@ function _bar(frac::Float64, width::Int; color::Bool = true)
     body = repeat('█', full) * (full < width ? string(partial) : "") *
            repeat(' ', max(width - full - (full < width ? 1 : 0), 0))
     return color ? string(_pctcolor(frac), body, "\e[0m") : body
+end
+
+# Two-tone bar: user time (green) stacked with sys time (red).
+function _bar2(fu::Float64, fs::Float64, width::Int; color::Bool = true)
+    ucells = floor(Int, clamp(fu, 0, 1) * width)
+    scells = floor(Int, clamp(fu + fs, 0, 1) * width) - ucells
+    pad = max(width - ucells - scells, 0)
+    color || return repeat('█', ucells) * repeat('▓', scells) * repeat(' ', pad)
+    return string("\e[32m", repeat('█', ucells), "\e[31m", repeat('█', scells), "\e[0m",
+        repeat(' ', pad))
 end
 
 function _spark(vals::Vector{Float64}, width::Int; color::Bool = true)
@@ -146,6 +177,40 @@ function _spark(vals::Vector{Float64}, width::Int; color::Bool = true)
     color && print(io, "\e[0m")
     print(io, repeat(' ', width - length(v)))
     return String(take!(io))
+end
+
+# Braille history graph: `rows` text rows tall, two samples per character column, so a
+# 2-row graph has 8 vertical levels at twice the horizontal density of block sparklines.
+# Right-aligned (newest sample at the right edge). Returns one String per row, top first.
+function _braille(vals::Vector{Float64}, width::Int, rows::Int; color::Bool = true)
+    # dot bits per char: left column top→bottom, then right column top→bottom
+    LEFT = (0x01, 0x02, 0x04, 0x40)
+    RIGHT = (0x08, 0x10, 0x20, 0x80)
+    n = 2 * width
+    v = length(vals) >= n ? vals[end-n+1:end] : vals
+    pad = width - cld(length(v), 2)
+    lines = [IOBuffer() for _ in 1:rows]
+    for l in lines
+        print(l, repeat(' ', pad))
+    end
+    total = 4 * rows
+    filled(x) = clamp(round(Int, clamp(x, 0, 1) * total), 0, total)
+    for i in 1:2:length(v)
+        fl = filled(v[i])
+        fr = i + 1 <= length(v) ? filled(v[i+1]) : 0
+        peak = max(v[i], i + 1 <= length(v) ? v[i+1] : 0.0)
+        for r in 1:rows
+            bits = 0x00
+            for d in 1:4  # dot rows top→bottom within this char row
+                b = (rows - r) * 4 + (5 - d)  # height index from the bottom
+                b <= fl && (bits |= LEFT[d])
+                b <= fr && (bits |= RIGHT[d])
+            end
+            color && print(lines[r], _pctcolor(peak))
+            print(lines[r], Char(0x2800 + bits))
+        end
+    end
+    return [String(take!(l)) * (color ? "\e[0m" : "") for l in lines]
 end
 
 const _USERNAMES = Dict{Int,String}()
@@ -178,20 +243,37 @@ function _julia_version_from_path(exe::AbstractString)
     return ""
 end
 
+# What a Julia process is doing, from its command line.
+_julia_role(cmd::AbstractString) =
+    occursin("--worker", cmd) ? "worker" :
+    occursin(r"--output-ji|Precompilation|precompilepkgs", cmd) ? "precompile" : ""
+
+# The active project from --project, shortened to its basename.
+function _julia_project(cmd::AbstractString)
+    m = match(r"--project(?:=(\S+))?", cmd)
+    m === nothing && return ""
+    v = m[1]
+    (v === nothing || v == "@.") && return "@."
+    return basename(rstrip(v, ('/', '\\')))
+end
+
 # ---- row assembly ----
 
 struct Row
     pid::Int
-    depth::Int          # tree indentation level
-    lastchild::Bool
+    prefix::String      # rendered tree glyphs ("│ ├─" etc.), empty in flat mode
     name::String
     uid::Int
     threads::Int
     rss::Int
     cpu::Float64        # percent
     time::Float64       # cumulative seconds
+    age::Float64        # seconds since the process started (-1 unknown)
+    state::Char
     isjulia::Bool
     ver::String         # Julia version label ("" when unknown / not Julia)
+    role::String        # "worker"/"precompile"/"" for Julia processes
+    project::String     # active --project for Julia processes
     cmd::String         # full command line ("" when unavailable)
 end
 
@@ -215,36 +297,42 @@ _sortval(st::TopState, r::Row) =
     st.sortkey === :mem ? Float64(r.rss) :
     st.sortkey === :pid ? Float64(r.pid) :
     st.sortkey === :time ? r.time :
+    st.sortkey === :age ? -r.age :
     st.sortkey === :threads ? Float64(r.threads) : 0.0
 
-function _mkrow(fr::Frame, pid::Int, depth::Int, lastchild::Bool, agg::Bool)
+function _mkrow(fr::Frame, pid::Int, prefix::String, agg::Bool)
     snap = fr.snap
     pids = agg ? _tree(snap, pid, true) : (pid,)
     isjulia = _isjulia(snap, pid)
-    return Row(pid, depth, lastchild,
+    cmd = get(snap.cmd, pid, "")
+    start = get(snap.start, pid, -1.0)
+    return Row(pid, prefix,
         get(snap.name, pid, "?"),
         get(snap.uid, pid, -1),
         sum(p -> get(snap.threads, p, 0), pids),
         sum(p -> get(snap.rss, p, 0), pids),
         sum(p -> get(fr.cpupct, p, 0.0), pids),
         sum(p -> get(snap.cputime, p, 0.0), pids),
+        start > 0 ? max(time() - start, 0.0) : -1.0,
+        get(snap.state, pid, ' '),
         isjulia,
         isjulia ? _julia_version_from_path(get(snap.exe, pid, "")) : "",
-        get(snap.cmd, pid, ""))
+        isjulia ? _julia_role(cmd) : "",
+        isjulia ? _julia_project(cmd) : "",
+        cmd)
 end
 
 function _rows(st::TopState, fr::Frame)
     snap = fr.snap
     allpids = union(keys(snap.cputime), keys(snap.ppid))
     if !st.tree
-        rows = Row[_mkrow(fr, pid, 0, false, false) for pid in allpids if _match(st, snap, pid)]
+        rows = Row[_mkrow(fr, pid, "", false) for pid in allpids if _match(st, snap, pid)]
         by = st.sortkey === :name ? (r -> lowercase(r.name)) : (r -> _sortval(st, r))
         sort!(rows; by, rev = st.rev && st.sortkey !== :name)
         return rows
     end
     # Tree mode: DFS from the roots, sorting siblings by the sort key. A filtered-out
-    # process is still shown (dimmed by depth only) if a descendant matches, so trees
-    # stay connected.
+    # process is still shown if a descendant matches, so trees stay connected.
     rows = Row[]
     keep = Dict{Int,Bool}()
     function matches_below(pid)::Bool
@@ -252,32 +340,95 @@ function _rows(st::TopState, fr::Frame)
             _match(st, snap, pid) || any(matches_below, get(snap.children, pid, Int[]))
         end
     end
-    roots = sort!([pid for pid in allpids
-                   if !haskey(snap.ppid, pid) || snap.ppid[pid] == pid ||
-                      !(snap.ppid[pid] in allpids)])
+    # Order roots and siblings by their whole subtree's totals (independent of the Σ
+    # display toggle), so "sort by CPU" surfaces the busiest tree even when its root is
+    # an idle shell. Precompute the keys: `sort!(by=...)` re-evaluates per comparison.
+    subkey = Dict{Int,Float64}()
+    treekey(pid) = get!(() -> _sortval(st, _mkrow(fr, pid, "", true)), subkey, pid)
+    roots = [pid for pid in allpids
+             if !haskey(snap.ppid, pid) || snap.ppid[pid] == pid ||
+                !(snap.ppid[pid] in allpids)]
+    sort!(roots; by = treekey, rev = st.rev)
     seen = Set{Int}()
-    function walk(pid, depth, lastchild)
+    # `stem` accumulates one glyph pair per ancestor: "│ " below an ancestor with later
+    # siblings, "  " below a last child — so vertical lines run continuously.
+    function walk(pid, stem, lastchild, isroot)
         pid in seen && return
         push!(seen, pid)
         matches_below(pid) || return
-        push!(rows, _mkrow(fr, pid, depth, lastchild, st.aggregate))
+        push!(rows, _mkrow(fr, pid, isroot ? "" : stem * (lastchild ? "└─" : "├─"),
+            st.aggregate))
         kids = [k for k in get(snap.children, pid, Int[]) if matches_below(k)]
-        sort!(kids; by = k -> _sortval(st, _mkrow(fr, k, 0, false, st.aggregate)), rev = st.rev)
+        sort!(kids; by = treekey, rev = st.rev)
+        childstem = isroot ? "" : stem * (lastchild ? "  " : "│ ")
         for (i, k) in enumerate(kids)
-            walk(k, depth + 1, i == length(kids))
+            walk(k, childstem, i == length(kids), false)
         end
     end
     for r in roots
-        walk(r, 0, false)
+        walk(r, "", false, true)
     end
     return rows
 end
+
+# ---- detail pane ----
+
+function _fdcount(pid::Int)
+    if Sys.isapple()
+        bi = Ref(ntuple(_ -> UInt32(0), 40))
+        r = ccall(:proc_pidinfo, Cint, (Cint, Cint, UInt64, Ptr{Cvoid}, Cint), pid, 3, 0, bi, 160)
+        return r > 0 ? Int(bi[][25]) : -1  # pbi_nfiles
+    elseif Sys.islinux()
+        try
+            return length(readdir("/proc/$pid/fd"))
+        catch
+            return -1
+        end
+    end
+    return -1
+end
+
+function _detail_lines(fr::Frame, r::Row, width::Int)
+    snap = fr.snap
+    started = r.age >= 0 ?
+        string(Libc.strftime("%b %d %H:%M:%S", time() - r.age), " (", _fmtage(r.age), " ago)") : "?"
+    pp = get(snap.ppid, r.pid, 0)
+    parent = pp > 0 ? string(pp, " ", get(snap.name, pp, "?")) : "?"
+    fds = _fdcount(r.pid)
+    cwd = Sys.islinux() ? (try readlink("/proc/$(r.pid)/cwd") catch; "" end) : ""
+    jl = r.isjulia ? string("  julia ", r.ver,
+        isempty(r.role) ? "" : "  role $(r.role)",
+        isempty(r.project) ? "" : "  project $(r.project)") : ""
+    lines = String[
+        string("pid ", r.pid, "  ", r.name, "  state ", r.state,
+            "  user ", r.uid < 0 ? "?" : _username(r.uid), jl),
+        string("cmd  ", isempty(r.cmd) ? "?" : r.cmd),
+        string("exe  ", get(snap.exe, r.pid, "?"), isempty(cwd) ? "" : "  cwd $cwd"),
+        string("started ", started, "  parent ", parent),
+        string("threads ", r.threads, "  rss ", _fmtbytes(r.rss),
+            "  cpu ", @sprintf("%.1f%%", r.cpu), "  cputime ", _fmttime(r.time),
+            fds >= 0 ? "  fds $fds" : ""),
+    ]
+    return [_ellipsize(" " * l, width) for l in lines]
+end
+
+const _HELP = """
+  q / Ctrl-C   quit                     space        pause
+  c m t p n s  sort: cpu, memory, cpu-time, pid, name, newest
+  T            tree view                a            Σ roll subtrees up (tree)
+  j            only Julia processes     C            show full command lines
+  /            filter (enter apply, esc clear)       u  only my processes
+  ↑ ↓ PgUp PgDn  select                 enter        detail pane
+  k / K        SIGTERM / SIGKILL selection (asks to confirm)
+  P            ask a Julia process to print a profile to its stderr
+  + / -        change refresh interval
+"""
 
 # ---- rendering ----
 
 function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, color::Bool = true)
     rows_avail, width = displaysize(io)
-    height = max(rows_avail, 12)
+    height = max(rows_avail, 14)
     width = max(width, 60)
     buf = IOBuffer()
     c(s) = color ? s : ""
@@ -287,22 +438,37 @@ function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, colo
     syscpu = isempty(fr.percore) ? 0.0 : sum(fr.percore) / length(fr.percore)
     memfrac = fr.memtotal > 0 ? fr.memused / fr.memtotal : 0.0
 
-    # header
+    # header: title, bar line, 2 braille history rows, cores line
     print(buf, c("\e[1m"), " ProcessMonitor", c("\e[0m"),
         "  ", gethostname(),
         "  up ", _fmtuptime(fr.uptime),
         @sprintf("  load %.2f %.2f %.2f", fr.loadavg...),
         "  ", length(fr.percore), " cores  ",
         fr.nprocs, " procs  ", fr.nthreads, " thr",
-        st.paused ? c("\e[33m") * "  ⏸ paused" * c("\e[0m") : "", eol)
+        st.paused ? c("\e[33m") * "  ⏸ paused" * c("\e[0m") : "")
+    # active mode badges, so toggles are visible at a glance
+    modes = String[]
+    st.tree && push!(modes, st.aggregate ? "tree Σ" : "tree")
+    st.juliaonly && push!(modes, "julia")
+    st.mine && push!(modes, "mine")
+    st.showcmd && push!(modes, "cmd")
+    isempty(st.filter) || push!(modes, "/" * st.filter)
+    isempty(modes) || print(buf, c("\e[46;30m"), " ", join(modes, " · "), " ", c("\e[0m"))
+    print(buf, eol)
 
-    barw = max(min(width ÷ 4, 30), 10)
-    sparkw = max(min(width - barw - 30, HIST_LEN), 10)
-    print(buf, " CPU ", c("▕"), _bar(syscpu, barw; color),
-        c("▏"), @sprintf("%5.1f%% ", 100syscpu), _spark(st.cpuhist, sparkw; color), eol)
-    print(buf, " MEM ", c("▕"), _bar(memfrac, barw; color), c("▏"),
-        @sprintf("%5.1f%% ", 100memfrac), _spark(st.memhist, sparkw; color),
-        "  ", _fmtbytes(fr.memused), "/", _fmtbytes(fr.memtotal), eol)
+    barw = max(min(width ÷ 5, 24), 10)
+    print(buf, " CPU ", c("▕"), _bar2(fr.fuser, fr.fsys, barw; color), c("▏"),
+        @sprintf("%5.1f%%", 100syscpu),
+        "   MEM ", c("▕"), _bar(memfrac, barw; color), c("▏"),
+        @sprintf("%5.1f%%  ", 100memfrac),
+        _fmtbytes(fr.memused), "/", _fmtbytes(fr.memtotal), eol)
+    graphw = max((width - 7) ÷ 2 - 1, 10)
+    cpug = _braille(st.cpuhist, graphw, 2; color)
+    memg = _braille(st.memhist, graphw, 2; color)
+    for r in 1:2
+        print(buf, "     ", cpug[r], "  ", memg[r], eol)
+    end
+
     # per-core bars plus a Julia rollup: how much of the machine is Julia right now
     print(buf, " cores ", _spark(fr.percore, length(fr.percore); color))
     jpids = [pid for pid in keys(fr.snap.cputime) if _isjulia(fr.snap, pid)]
@@ -315,23 +481,28 @@ function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, colo
     end
     print(buf, eol)
 
-    # column header
+    showspark = interactive && width >= 100
+    showage = width >= 88
+    namew = width - 51 - (showspark ? 9 : 0) - (showage ? 7 : 0)
     agg = st.tree && st.aggregate ? "Σ" : ""
-    namew = max(width - 48, 8)
     sortmark(k) = st.sortkey === k ? "▾" : " "
     print(buf, c("\e[7m"),
         lpad("PID", 7), " ",
         rpad("USER", 8), " ",
+        "S", " ",
         _ellipsize("NAME" * sortmark(:name), namew), " ",
+        showspark ? rpad("HIST", 8) * " " : "",
         lpad("THR" * sortmark(:threads), 5), " ",
         lpad(agg * "RSS" * sortmark(:mem), 7), " ",
+        showage ? lpad("AGE" * sortmark(:age), 6) * " " : "",
         lpad("TIME" * sortmark(:time), 8), " ",
         lpad(agg * "CPU%" * sortmark(:cpu), 7),
         c("\e[0m"), eol)
 
     rows = _rows(st, fr)
+    detailh = st.detail ? 6 : 0
     # Interactive mode fits the terminal; a single-frame dump includes every row.
-    nbody = interactive ? height - 7 : length(rows)
+    nbody = interactive ? height - 7 - detailh : length(rows)
     st.sel = clamp(st.sel, 1, max(length(rows), 1))
     st.scroll = clamp(st.scroll, 0, max(length(rows) - nbody, 0))
     if st.sel <= st.scroll
@@ -340,46 +511,79 @@ function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, colo
         st.scroll = st.sel - nbody
     end
     self = getpid()
-    for i in (st.scroll + 1):min(st.scroll + nbody, length(rows))
-        r = rows[i]
-        selected = interactive && i == st.sel
-        prefix = r.depth == 0 ? "" : repeat("  ", r.depth - 1) * (r.lastchild ? "└─" : "├─")
-        cpufrac = r.cpu / 100 / max(length(fr.percore), 1)
-        selected && print(buf, c("\e[7m"))
-        # Julia processes: magenta name, version label, and (with `C`) the command line
-        label = if st.showcmd && !isempty(r.cmd)
-            r.cmd
-        elseif r.isjulia && !isempty(r.ver)
-            string(r.name, " ", r.ver)
-        else
-            r.name
+
+    if st.help && interactive
+        for l in split(_HELP, '\n')
+            print(buf, l, eol)
         end
-        print(buf, lpad(r.pid, 7), " ",
-            c(r.uid == Int(ccall(:getuid, Cuint, ())) ? "\e[36m" : "\e[2m"),
-            rpad(_ellipsize(r.uid < 0 ? "?" : _username(r.uid), 8), 8), c("\e[0m"),
-            selected ? c("\e[7m") : "", " ",
-            r.pid == self ? c("\e[1m") : r.isjulia ? c("\e[35m") : "",
-            _ellipsize(prefix * label, namew), c(selected ? "" : "\e[0m"), " ",
-            lpad(r.threads == 0 ? "?" : string(r.threads), 5), " ",
-            lpad(_fmtbytes(r.rss), 7), " ",
-            lpad(_fmttime(r.time), 8), " ",
-            c(selected ? "" : _pctcolor(cpufrac)),
-            lpad(@sprintf("%.1f", r.cpu), 7), c("\e[0m"), eol)
-    end
-    if interactive
-        for _ in (length(rows) - st.scroll):(nbody - 1)
+        for _ in (length(split(_HELP, '\n'))):(nbody - 1)
             print(buf, eol)
+        end
+    else
+        for i in (st.scroll + 1):min(st.scroll + nbody, length(rows))
+            r = rows[i]
+            selected = interactive && i == st.sel
+            prefix = r.prefix
+            cpufrac = r.cpu / 100 / max(length(fr.percore), 1)
+            selected && print(buf, c("\e[7m"))
+            # Julia rows: magenta, labeled with version/role/project; C swaps in the cmdline
+            label = if st.showcmd && !isempty(r.cmd)
+                r.cmd
+            elseif r.isjulia
+                join(filter(!isempty, [isempty(r.ver) ? r.name : "$(r.name) $(r.ver)",
+                    r.role, r.project]), " · ")
+            else
+                r.name
+            end
+            statecol = r.state == 'Z' ? "\e[31m" : r.state == 'D' ? "\e[33m" : "\e[2m"
+            print(buf, lpad(r.pid, 7), " ",
+                c(r.uid == Int(ccall(:getuid, Cuint, ())) ? "\e[36m" : "\e[2m"),
+                rpad(_ellipsize(r.uid < 0 ? "?" : _username(r.uid), 8), 8), c("\e[0m"),
+                selected ? c("\e[7m") : "", " ",
+                c(selected ? "" : statecol), r.state, c(selected ? "" : "\e[0m"),
+                selected ? "" : "", " ",
+                r.pid == self ? c("\e[1m") : r.isjulia ? c("\e[35m") : "",
+                _ellipsize(prefix * label, namew), c(selected ? "" : "\e[0m"), " ",
+                showspark ? _spark(get(st.pidhist, r.pid, Float64[]), 8;
+                    color = color && !selected) * " " : "",
+                lpad(r.threads == 0 ? "?" : string(r.threads), 5), " ",
+                lpad(_fmtbytes(r.rss), 7), " ",
+                showage ? lpad(_fmtage(r.age), 6) * " " : "",
+                lpad(_fmttime(r.time), 8), " ",
+                c(selected ? "" : _pctcolor(cpufrac)),
+                lpad(@sprintf("%.1f", r.cpu), 7), c("\e[0m"), eol)
+        end
+        if interactive
+            for _ in (length(rows) - st.scroll):(nbody - 1)
+                print(buf, eol)
+            end
+        end
+    end
+
+    if interactive
+        if st.detail && 1 <= st.sel <= length(rows)
+            print(buf, c("\e[2m"), repeat('─', width), c("\e[0m"), eol)
+            for l in _detail_lines(fr, rows[st.sel], width)
+                print(buf, c("\e[2m"), l, c("\e[0m"), eol)
+            end
+        elseif st.detail
+            for _ in 1:6
+                print(buf, eol)
+            end
         end
         # footer
         if st.filtering
             print(buf, c("\e[1m"), " filter: ", st.filter, "▌", c("\e[0m"),
                 "  (enter to apply, esc to clear)", "\e[K")
+        elseif st.pendpid != 0
+            print(buf, c("\e[33;1m"), " send SIG", st.pendsig == 9 ? "KILL" : "TERM",
+                " to ", st.pendpid, "?  y to confirm, any other key cancels", c("\e[0m"), "\e[K")
         elseif !isempty(st.message)
             print(buf, c("\e[33m"), " ", st.message, c("\e[0m"), "\e[K")
         else
             print(buf, c("\e[2m"),
-                " q quit  c/m/p/t/n sort  T tree  a Σ  j julia  C cmd  / filter  u mine  ↑↓  ",
-                "k/K kill  +/- (", round(st.interval, digits = 1), "s)  space pause",
+                " q quit  ? help  c/m/t/p/n/s sort  T tree  a Σ  j julia  C cmd  / filter  ",
+                "enter detail  k/K kill  P profile  (", round(st.interval, digits = 1), "s)",
                 c("\e[0m"), "\e[K")
         end
     end
@@ -396,38 +600,30 @@ An interactive, `htop`-like view of the system's processes, built on the same sn
 machinery as the rest of the package. Requires an interactive terminal; `top(io)` renders
 a single non-interactive frame to any `IO` instead.
 
-Header: system CPU and memory with scrolling history sparklines, one mini-bar per core,
-load averages, uptime, and process/thread totals. Below it, the process table.
-
-Keys:
-- `q`/`Ctrl-C` — quit; `space` — pause
-- `c`/`m`/`t`/`p`/`n` — sort by CPU, memory, CPU time, pid, or name
-- `T` — toggle tree view; `a` — in tree view, roll each subtree's CPU/RSS up into its row
-- `/` — filter by name or pid substring (`enter` applies, `esc` clears); `u` — only your
-  own processes
-- `↑`/`↓`/`PgUp`/`PgDn` — select; `k` sends SIGTERM, `K` sends SIGKILL to the selection
-- `+`/`-` — change the refresh interval
+The header shows system CPU (user green / sys red) and memory with braille history
+graphs, one mini-bar per core, load averages, uptime, process/thread totals, and a rollup
+of all Julia processes (count, CPU, memory, threads). Julia rows are highlighted and
+labeled with version (from the install path), role (`worker`, `precompile`) and
+`--project`. Press `?` for the key reference.
 """
 function top(; interval::Real = 2.0, tree::Bool = false)
     Sys.iswindows() && error("ProcessMonitor: Windows is not yet supported")
     stdout isa Base.TTY || error("top() needs an interactive terminal; use top(io) for one frame")
-    st = TopState(; interval = Float64(interval), tree)
+    st = TopState(; interval, tree)
     term = REPL.Terminals.TTYTerminal(get(ENV, "TERM", ""), stdin, stdout, stderr)
-    keych = Channel{Char}(64)
-    reader = @async try
-        while isopen(keych)
-            put!(keych, Char(read(stdin, UInt8)))
-        end
-    catch
-    end
     REPL.Terminals.raw!(term, true)
+    # Poll stdin on this task rather than blocking-read in a helper task: an orphaned
+    # blocked read would survive top() and swallow the first byte of every escape
+    # sequence the REPL receives afterwards.
+    Base.start_reading(stdin)
+    queue = UInt8[]
     print(stdout, "\e[?1049h\e[?25l\e[2J")  # alternate screen, hide cursor
     prev = _snapshot(full = true)
     prevcores = Sys.cpu_info()
     prevt = time()
     fr = nothing
     lastrefresh = 0.0
-    nrows = 0
+    sleep(0.15)  # short priming sample: the first frame appears immediately with real data
     try
         while st.running
             if !st.paused && time() - lastrefresh >= st.interval
@@ -437,43 +633,125 @@ function top(; interval::Real = 2.0, tree::Bool = false)
                 fr = _frame(prev, snap, prevcores, cores, max(t - prevt, 0.001))
                 prev, prevcores, prevt = snap, cores, t
                 lastrefresh = t
-                syscpu = isempty(fr.percore) ? 0.0 : sum(fr.percore) / length(fr.percore)
-                push!(st.cpuhist, syscpu)
-                push!(st.memhist, fr.memtotal > 0 ? fr.memused / fr.memtotal : 0.0)
-                length(st.cpuhist) > HIST_LEN && popfirst!(st.cpuhist)
-                length(st.memhist) > HIST_LEN && popfirst!(st.memhist)
+                _push_hist!(st, fr)
                 st.message = ""
-                fr === nothing || (nrows = _render(stdout, st, fr))
+                _render(stdout, st, fr)
             end
-            # wait for a key or the next refresh tick
-            key = nothing
+            # wait for input or the next refresh tick
             deadline = time() + 0.05
-            while time() < deadline
-                if isready(keych)
-                    key = take!(keych)
-                    break
-                end
+            while time() < deadline && bytesavailable(stdin) == 0
                 sleep(0.01)
             end
-            key === nothing && continue
-            _handle_key!(st, key, keych, fr, nrows)
-            fr === nothing || (nrows = _render(stdout, st, fr))
+            bytesavailable(stdin) > 0 && append!(queue, readavailable(stdin))
+            if _drain_keys!(st, queue, fr) && fr !== nothing
+                _render(stdout, st, fr)
+            end
         end
     finally
-        close(keych)
+        try
+            Base.stop_reading(stdin)
+        catch
+        end
         print(stdout, "\e[?25h\e[?1049l")  # restore cursor and screen
         REPL.Terminals.raw!(term, false)
     end
     return nothing
 end
 
-function _handle_key!(st::TopState, key::Char, keych::Channel{Char}, fr, nrows::Int)
+# Consume all buffered input bytes, assembling escape sequences (they arrive atomically
+# from readavailable). Returns true if anything was processed.
+function _drain_keys!(st::TopState, queue::Vector{UInt8}, fr)
+    changed = false
+    while !isempty(queue) && st.running
+        b = popfirst!(queue)
+        changed = true
+        if b == 0x1b
+            if !isempty(queue) && queue[1] == UInt8('[')
+                popfirst!(queue)
+                # consume a full CSI sequence: parameter bytes, then a final in 0x40-0x7e
+                params = UInt8[]
+                final = ' '
+                while !isempty(queue)
+                    b2 = popfirst!(queue)
+                    if 0x40 <= b2 <= 0x7e
+                        final = Char(b2)
+                        break
+                    end
+                    push!(params, b2)
+                end
+                ps = split(String(params), ';')
+                if st.help
+                    st.help = false
+                elseif final == 'A'
+                    st.sel = max(st.sel - 1, 1)
+                elseif final == 'B'
+                    st.sel += 1  # clamped in render
+                elseif final == '~' && !isempty(ps) && (ps[1] == "5" || ps[1] == "6")
+                    st.sel = ps[1] == "5" ? max(st.sel - 20, 1) : st.sel + 20
+                elseif final == 'u'  # CSI-u (modifyOtherKeys): "code;modifiers u"
+                    code = isempty(ps) ? nothing : tryparse(Int, ps[1])
+                    mods = length(ps) >= 2 ? something(tryparse(Int, ps[2]), 1) : 1
+                    if code !== nothing && 0 < code <= 0x10ffff
+                        ch = Char(code)
+                        # the code is the unshifted key; modifier bit 1 is shift
+                        ((mods - 1) & 1) != 0 && (ch = uppercase(ch))
+                        _handle_key!(st, ch, fr)
+                    end
+                end
+            elseif length(queue) >= 2 && queue[1] == UInt8('O')  # SS3 arrows (\eOA/\eOB)
+                popfirst!(queue)
+                k2 = Char(popfirst!(queue))
+                k2 == 'A' && (st.sel = max(st.sel - 1, 1))
+                k2 == 'B' && (st.sel += 1)
+            elseif st.filtering  # bare escape clears the filter
+                st.filtering = false
+                st.filter = ""
+            elseif st.help
+                st.help = false
+            end
+        else
+            _handle_key!(st, Char(b), fr)
+        end
+    end
+    return changed
+end
+
+function _push_hist!(st::TopState, fr::Frame)
+    syscpu = isempty(fr.percore) ? 0.0 : sum(fr.percore) / length(fr.percore)
+    push!(st.cpuhist, syscpu)
+    push!(st.memhist, fr.memtotal > 0 ? fr.memused / fr.memtotal : 0.0)
+    length(st.cpuhist) > HIST_LEN && popfirst!(st.cpuhist)
+    length(st.memhist) > HIST_LEN && popfirst!(st.memhist)
+    for (pid, pct) in fr.cpupct
+        h = get!(() -> Float64[], st.pidhist, pid)
+        push!(h, pct / 100)  # scaled so 1.0 == one full core
+        length(h) > 16 && popfirst!(h)
+    end
+    for pid in collect(keys(st.pidhist))
+        haskey(fr.cpupct, pid) || delete!(st.pidhist, pid)
+    end
+    return
+end
+
+function _handle_key!(st::TopState, key::Char, fr)
+    if st.help
+        st.help = false
+        return
+    end
+    if st.pendpid != 0  # kill confirmation
+        if key == 'y'
+            ok = ccall(:kill, Cint, (Cint, Cint), st.pendpid, st.pendsig) == 0
+            st.message = ok ? "sent SIG$(st.pendsig == 9 ? "KILL" : "TERM") to $(st.pendpid)" :
+                              "kill $(st.pendpid) failed: $(Libc.strerror(Libc.errno()))"
+        else
+            st.message = ""
+        end
+        st.pendpid = 0
+        return
+    end
     if st.filtering
         if key == '\r' || key == '\n'
             st.filtering = false
-        elseif key == '\e' && !isready(keych)
-            st.filtering = false
-            st.filter = ""
         elseif key == '\x7f' || key == '\b'
             isempty(st.filter) || (st.filter = st.filter[1:prevind(st.filter, end)])
         elseif isprint(key)
@@ -482,30 +760,22 @@ function _handle_key!(st::TopState, key::Char, keych::Channel{Char}, fr, nrows::
         st.sel = 1
         return
     end
-    if key == '\e'  # escape sequence (arrows, page keys) or bare escape
-        sleep(0.01)
-        if isready(keych) && take!(keych) == '['
-            isready(keych) || return
-            k2 = take!(keych)
-            if k2 == 'A'
-                st.sel = max(st.sel - 1, 1)
-            elseif k2 == 'B'
-                st.sel += 1  # clamped in render
-            elseif k2 == '5' || k2 == '6'  # PgUp / PgDn (trailing ~)
-                isready(keych) && take!(keych)
-                st.sel = k2 == '5' ? max(st.sel - 20, 1) : st.sel + 20
-            end
-        end
-    elseif key == 'q' || key == '\x03'
+    if key == 'q' || key == '\x03'
         st.running = false
+    elseif key == '?'
+        st.help = true
     elseif key == ' '
         st.paused = !st.paused
+    elseif key == '\r' || key == '\n'
+        st.detail = !st.detail
     elseif key == 'c'
         st.sortkey = :cpu; st.rev = true
     elseif key == 'm'
         st.sortkey = :mem; st.rev = true
     elseif key == 't'
         st.sortkey = :time; st.rev = true
+    elseif key == 's'
+        st.sortkey = :age; st.rev = true  # sorts by -age: newest first
     elseif key == 'p'
         st.sortkey = :pid; st.rev = false
     elseif key == 'n'
@@ -530,14 +800,24 @@ function _handle_key!(st::TopState, key::Char, keych::Channel{Char}, fr, nrows::
         st.interval = min(st.interval * 2, 60.0)
     elseif key == '-'
         st.interval = max(st.interval / 2, 0.25)
+    elseif key == 'P' && fr !== nothing
+        rows = _rows(st, fr)
+        if 1 <= st.sel <= length(rows)
+            r = rows[st.sel]
+            if r.isjulia
+                sig = Sys.islinux() ? 10 : 29  # SIGUSR1 / SIGINFO: one-shot profile print
+                ok = ccall(:kill, Cint, (Cint, Cint), r.pid, sig) == 0
+                st.message = ok ? "asked $(r.pid) to print a profile to its stderr" :
+                                  "signal failed: $(Libc.strerror(Libc.errno()))"
+            else
+                st.message = "$(r.pid) is not a Julia process"
+            end
+        end
     elseif (key == 'k' || key == 'K') && fr !== nothing
         rows = _rows(st, fr)
         if 1 <= st.sel <= length(rows)
-            pid = rows[st.sel].pid
-            sig = key == 'K' ? 9 : 15
-            ok = ccall(:kill, Cint, (Cint, Cint), pid, sig) == 0
-            st.message = ok ? "sent SIG$(sig == 9 ? "KILL" : "TERM") to $pid" :
-                              "kill $pid failed: $(Libc.strerror(Libc.errno()))"
+            st.pendpid = rows[st.sel].pid
+            st.pendsig = key == 'K' ? 9 : 15
         end
     end
     return
@@ -551,15 +831,25 @@ return the number of process rows. Non-interactive; useful for logging and testi
 """
 function top(io::IO; interval::Real = 0.5, tree::Bool = false, color::Bool = false)
     Sys.iswindows() && error("ProcessMonitor: Windows is not yet supported")
-    st = TopState(; interval = Float64(interval), tree)
+    st = TopState(; interval, tree)
     prev = _snapshot(full = true)
     prevcores = Sys.cpu_info()
     t0 = time()
     sleep(interval)
     snap = _snapshot(full = true)
     fr = _frame(prev, snap, prevcores, Sys.cpu_info(), max(time() - t0, 0.001))
-    syscpu = isempty(fr.percore) ? 0.0 : sum(fr.percore) / length(fr.percore)
-    push!(st.cpuhist, syscpu)
-    push!(st.memhist, fr.memtotal > 0 ? fr.memused / fr.memtotal : 0.0)
+    _push_hist!(st, fr)
     return _render(io, st, fr; interactive = false, color)
+end
+
+# Compile the frame/render path into the package image so the first interactive frame
+# does not pay JIT latency.
+if ccall(:jl_generating_output, Cint, ()) == 1 && !Sys.iswindows()
+    let io = IOBuffer()
+        try
+            top(io; interval = 0.01)
+            top(io; interval = 0.01, tree = true, color = true)
+        catch
+        end
+    end
 end

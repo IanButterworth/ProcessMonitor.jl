@@ -38,10 +38,12 @@ struct Snapshot
     uid::Dict{Int,Int}              # pid -> owning user id
     exe::Dict{Int,String}           # pid -> executable path (full snapshots only)
     cmd::Dict{Int,String}           # pid -> full command line (full snapshots only)
+    start::Dict{Int,Float64}        # pid -> start time, unix epoch seconds
+    state::Dict{Int,Char}           # pid -> scheduler state (R/S/D/T/Z/I)
 end
 Snapshot() = Snapshot(Dict{Int,Float64}(), Dict{Int,Int}(), Dict{Int,Int}(),
     Dict{Int,Vector{Int}}(), Dict{Int,Int}(), Dict{Int,String}(), Dict{Int,Int}(),
-    Dict{Int,String}(), Dict{Int,String}())
+    Dict{Int,String}(), Dict{Int,String}(), Dict{Int,Float64}(), Dict{Int,Char}())
 
 # `full` additionally gathers executable paths and command lines (used by `top`); the
 # plain API skips them so samplers stay cheap.
@@ -52,11 +54,27 @@ function _snapshot(; full::Bool = false)
     return _snapshot_ps(full)
 end
 
+# Boot time (unix epoch), needed to convert /proc starttime ticks; constant per boot.
+const _BTIME = Ref(-1.0)
+function _btime()
+    if _BTIME[] < 0
+        raw = try
+            read("/proc/stat", String)
+        catch
+            ""
+        end
+        m = match(r"btime (\d+)", raw)
+        _BTIME[] = m === nothing ? 0.0 : parse(Float64, m[1])
+    end
+    return _BTIME[]
+end
+
 # Linux: read everything straight from /proc/<pid>/stat.
 function _snapshot_proc(full::Bool = false)
     s = Snapshot()
     hz = ccall(:sysconf, Clong, (Cint,), 2)  # _SC_CLK_TCK
     hz <= 0 && (hz = 100)
+    btime = _btime()
     pagesize = Int(ccall(:getpagesize, Cint, ()))
     names = try
         readdir("/proc")
@@ -87,6 +105,9 @@ function _snapshot_proc(full::Bool = false)
         s.cputime[pid] = (utime + stime) / hz
         nthr === nothing || (s.threads[pid] = nthr)
         rsspages === nothing || (s.rss[pid] = rsspages * pagesize)
+        isempty(f[1]) || (s.state[pid] = f[1][1])
+        startticks = tryparse(Int, f[20])
+        (startticks === nothing || btime <= 0) || (s.start[pid] = btime + startticks / hz)
         s.name[pid] = String(SubString(stat, nextind(stat, lp), prevind(stat, rp)))
         st = try
             Base.stat("/proc/$name")
@@ -152,6 +173,10 @@ function _snapshot_libproc(full::Bool = false)
             s.ppid[pid] = Int(b[5])
             s.uid[pid] = Int(b[6])
             push!(get!(s.children, Int(b[5]), Int[]), pid)
+            # pbi_status: 1=idle 2=run 3=sleep 4=stopped 5=zombie
+            s.state[pid] = get(('I', 'R', 'S', 'T', 'Z'), Int(b[2]), '?')
+            # pbi_start_tvsec: uint64 at byte offset 120
+            s.start[pid] = Float64(UInt64(b[31]) | (UInt64(b[32]) << 32))
         end
         n = ccall(:proc_name, Cint, (Cint, Ptr{UInt8}, UInt32), pid, nb, length(nb))
         n > 0 && (s.name[pid] = String(nb[1:n]))
@@ -198,12 +223,17 @@ function _snapshot_ps(full::Bool = false)
     s = Snapshot()
     # Separate `-o` flags (not `-o pid=,ppid=,...`): some BSD `ps` treat the text after
     # the first `=` as a header, collapsing the output to one column. Full snapshots
-    # request `args` (the whole command line) instead of `comm`.
-    lastcol(full) = full ? `-o args=` : `-o comm=`
-    for (nnum, cols) in (
-        (6, `-o pid= -o ppid= -o time= -o rss= -o uid= -o nlwp= $(lastcol(full))`),
-        (5, `-o pid= -o ppid= -o time= -o rss= -o uid= $(lastcol(full))`),
-    )
+    # additionally request elapsed time and state, and `args` (the whole command line)
+    # instead of `comm`.
+    specs = if full
+        ((8, `-o pid= -o ppid= -o time= -o rss= -o uid= -o nlwp= -o etime= -o state= -o args=`),
+         (7, `-o pid= -o ppid= -o time= -o rss= -o uid= -o etime= -o state= -o args=`))
+    else
+        ((6, `-o pid= -o ppid= -o time= -o rss= -o uid= -o nlwp= -o comm=`),
+         (5, `-o pid= -o ppid= -o time= -o rss= -o uid= -o comm=`))
+    end
+    nowt = time()
+    for (nnum, cols) in specs
         raw = try
             read(`ps -A $cols`, String)
         catch
@@ -222,9 +252,14 @@ function _snapshot_ps(full::Bool = false)
             s.cputime[pid] = secs
             rsskb === nothing || (s.rss[pid] = rsskb * 1024)
             uid === nothing || (s.uid[pid] = uid)
-            if nnum == 6
+            if nnum == 6 || nnum == 8
                 nthr = tryparse(Int, f[6])
                 nthr === nothing || (s.threads[pid] = nthr)
+            end
+            if full
+                elapsed = _parse_cpu_time(f[nnum - 1])
+                elapsed === nothing || (s.start[pid] = nowt - elapsed)
+                isempty(f[nnum]) || (s.state[pid] = f[nnum][1])
             end
             if length(f) > nnum
                 rest = join(f[nnum+1:end], ' ')
