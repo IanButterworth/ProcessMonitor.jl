@@ -7,11 +7,12 @@ Utilization is derived by differencing two samples of a process's cumulative CPU
 always describes an *interval*, never an instant. `100%` means one CPU core was fully used on
 average over the interval; a process using several cores can report more than `100%`.
 
-CPU time is read from `/proc` on Linux (no external tools, so it works in minimal
-containers) and from `ps` on macOS and the BSDs, where `ps` is always in the base system.
-The `%cpu` column that `ps`/`top` report is deliberately avoided: it is a platform-dependent
-decaying average (FreeBSD, for instance, often reports ~0), whereas differencing cumulative
-CPU time is portable. Windows is not yet supported.
+CPU time is read without spawning a subprocess: from `/proc` on Linux (so it works in
+minimal containers) and via libproc syscalls on macOS (so it works under sandboxes that
+forbid executing `ps`). The BSDs use `ps`, which is always in the base system. The `%cpu`
+column that `ps`/`top` report is deliberately avoided: it is a platform-dependent decaying
+average (FreeBSD, for instance, often reports ~0), whereas differencing cumulative CPU time
+is portable. Windows is not yet supported.
 
 ## Installation
 

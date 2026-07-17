@@ -12,11 +12,11 @@ it always describes an interval, never an instant. The core primitive is [`CPUSa
 (non-blocking, reusable for polling); [`cpu_percent`](@ref) also has a blocking convenience
 method that samples over a fixed interval for you.
 
-CPU time is read from `/proc` on Linux (no external tools, so it works in minimal
-containers) and from `ps` on macOS and the BSDs, where `ps` is always in the base system.
-The `%cpu` column that `ps` and `top` report is deliberately avoided because it is a
-platform-dependent decaying average (e.g. FreeBSD reports ~0); differencing cumulative CPU
-time is portable.
+CPU time is read without spawning any subprocess: from `/proc` on Linux (so it works in
+minimal containers) and via libproc syscalls on macOS (so it works under sandboxes that
+forbid executing `ps`). The BSDs use `ps`, which is always in the base system. The `%cpu`
+column that `ps` and `top` report is deliberately avoided because it is a platform-dependent
+decaying average (e.g. FreeBSD reports ~0); differencing cumulative CPU time is portable.
 
 Windows is not yet supported.
 """
@@ -26,7 +26,41 @@ CPUMonitor
 # snapshot. Throws on Windows.
 function _snapshot()
     Sys.iswindows() && error("CPUMonitor: Windows is not yet supported")
-    return Sys.islinux() ? _snapshot_proc() : _snapshot_ps()
+    Sys.islinux() && return _snapshot_proc()
+    Sys.isapple() && return _snapshot_libproc()
+    return _snapshot_ps()
+end
+
+# macOS: gather CPU time and parent links via libproc syscalls, without spawning a
+# subprocess (some sandboxes forbid executing `ps`). proc_pid_rusage reports user+system
+# time in mach ticks (converted with mach_timebase); proc_pidinfo(PROC_PIDTBSDINFO) gives
+# the parent pid. Both only succeed for own-uid processes, which is all we need.
+function _snapshot_libproc()
+    cputime = Dict{Int,Float64}()
+    children = Dict{Int,Vector{Int}}()
+    tb = Ref((UInt32(0), UInt32(0)))
+    ccall(:mach_timebase_info, Cint, (Ptr{Cvoid},), tb) == 0 || return cputime, children
+    numer, denom = tb[]
+    (numer == 0 || denom == 0) && return cputime, children
+    scale = numer / denom / 1e9  # mach ticks -> seconds (numer/denom is 1/1 on Intel)
+    npids = ccall(:proc_listallpids, Cint, (Ptr{Cvoid}, Cint), C_NULL, 0)
+    npids > 0 || return cputime, children
+    pids = Vector{Cint}(undef, npids + 128)  # headroom for pids spawned since the count
+    got = ccall(:proc_listallpids, Cint, (Ptr{Cint}, Cint), pids, sizeof(Cint) * length(pids))
+    rb = Ref(ntuple(_ -> UInt64(0), 16))  # rusage_info_v0: uuid[16B], ri_user_time, ri_system_time, ...
+    bi = Ref(ntuple(_ -> UInt32(0), 40))  # proc_bsdinfo: pbi_ppid is the 5th uint32
+    for i in 1:min(got, length(pids))
+        pid = Int(pids[i])
+        pid > 0 || continue
+        if ccall(:proc_pid_rusage, Cint, (Cint, Cint, Ptr{Cvoid}), pid, 0, rb) == 0
+            t = rb[]
+            cputime[pid] = (t[3] + t[4]) * scale
+        end
+        if ccall(:proc_pidinfo, Cint, (Cint, Cint, UInt64, Ptr{Cvoid}, Cint), pid, 3, 0, bi, 160) > 0
+            push!(get!(children, Int(bi[][5]), Int[]), pid)
+        end
+    end
+    return cputime, children
 end
 
 # Linux: read utime+stime and ppid straight from /proc/<pid>/stat.
@@ -59,11 +93,13 @@ function _snapshot_proc()
     return cputime, children
 end
 
-# macOS / BSD: one `ps` snapshot of the full process table.
+# BSD: one `ps` snapshot of the full process table.
 function _snapshot_ps()
     cputime = Dict{Int,Float64}()
     children = Dict{Int,Vector{Int}}()
-    raw = read(`ps -A -o pid=,ppid=,time=`, String)
+    # Separate `-o` flags (not `-o pid=,ppid=,time=`): some BSD `ps` treat the text after
+    # the first `=` as a header, collapsing the output to one column.
+    raw = read(`ps -A -o pid= -o ppid= -o time=`, String)
     for line in eachline(IOBuffer(raw))
         f = split(line)
         length(f) == 3 || continue
