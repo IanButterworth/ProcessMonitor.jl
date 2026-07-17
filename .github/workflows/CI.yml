@@ -38,5 +38,10 @@ jobs:
           release: "14.3"
           usesh: true
           copyback: false
-          prepare: pkg install -y julia
-          run: julia --project --startup-file=no -e 'using Pkg; Pkg.test()'
+          prepare: |
+            fetch -o /tmp/julia.tar.gz \
+              https://julialang-s3.julialang.org/bin/freebsd/x64/1.10/julia-1.10.11-freebsd-x86_64.tar.gz
+            sha256 -c 99ee7a28a35de5e2447875f0355893bd9f30149c908c56af48bd59e375a718e5 \
+              /tmp/julia.tar.gz
+            tar -xzf /tmp/julia.tar.gz -C /usr/local
+          run: /usr/local/julia-1.10.11/bin/julia --project --startup-file=no -e 'using Pkg; Pkg.test()'
