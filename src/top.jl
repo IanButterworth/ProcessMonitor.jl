@@ -24,6 +24,8 @@ Base.@kwdef mutable struct TopState
     help::Bool = false       # show the help overlay
     pendpid::Int = 0         # pending kill confirmation target (0 = none)
     pendsig::Int = 0
+    pendstart::Float64 = -1.0
+    escpending::Float64 = 0.0 # monotonic time when an incomplete escape sequence arrived
     interval::Float64 = 2.0
     running::Bool = true
     cpuhist::Vector{Float64} = Float64[]
@@ -350,8 +352,12 @@ function _rows(st::TopState, fr::Frame)
     # Order roots and siblings by their whole subtree's totals (independent of the Σ
     # display toggle), so "sort by CPU" surfaces the busiest tree even when its root is
     # an idle shell. Precompute the keys: `sort!(by=...)` re-evaluates per comparison.
-    subkey = Dict{Int,Float64}()
-    treekey(pid) = get!(() -> _sortval(st, _mkrow(fr, pid, "", true)), subkey, pid)
+    treekey = if st.sortkey === :name
+        pid -> lowercase(get(snap.name, pid, ""))
+    else
+        subkey = Dict{Int,Float64}()
+        pid -> get!(() -> _sortval(st, _mkrow(fr, pid, "", true)), subkey, pid)
+    end
     roots = [pid for pid in allpids
              if !haskey(snap.ppid, pid) || snap.ppid[pid] == pid ||
                 !(snap.ppid[pid] in allpids)]
@@ -393,6 +399,29 @@ function _fdcount(pid::Int)
         end
     end
     return -1
+end
+
+# A displayed PID may have exited and been reused before the user confirms an action.
+# Full BSD snapshots estimate start time from second-resolution elapsed time, hence the
+# small tolerance; Linux and macOS start times are stable within it.
+function _same_process(pid::Integer, expected_start::Float64)
+    expected_start > 0 || return false
+    pid = Int(pid)
+    snap = try
+        _snapshot(full = true)
+    catch
+        return false
+    end
+    current_start = get(snap.start, pid, -1.0)
+    return current_start > 0 && abs(current_start - expected_start) <= 2.0
+end
+
+function _send_signal(pid::Integer, sig::Integer, expected_start::Float64)
+    pid, sig = Int(pid), Int(sig)
+    _same_process(pid, expected_start) ||
+        return false, "process $pid exited or changed; no signal sent"
+    ok = ccall(:kill, Cint, (Cint, Cint), pid, sig) == 0
+    return ok, ok ? "" : "signal failed: $(Libc.strerror(Libc.errno()))"
 end
 
 # Wrap `label * text` to `width` columns, indenting continuation lines under the label so
@@ -651,25 +680,30 @@ function top(; interval::Real = 2.0, tree::Bool = false)
     stdout isa Base.TTY || error("top() needs an interactive terminal; use top(io) for one frame")
     st = TopState(; interval, tree)
     term = REPL.Terminals.TTYTerminal(get(ENV, "TERM", ""), stdin, stdout, stderr)
-    REPL.Terminals.raw!(term, true)
-    # Poll stdin on this task rather than blocking-read in a helper task: an orphaned
-    # blocked read would survive top() and swallow the first byte of every escape
-    # sequence the REPL receives afterwards.
-    Base.start_reading(stdin)
-    queue = UInt8[]
-    print(stdout, "\e[?1049h\e[?25l\e[2J")  # alternate screen, hide cursor
-    prev = _snapshot(full = true)
-    prevcores = Sys.cpu_info()
-    prevt = time()
-    fr = nothing
-    lastrefresh = 0.0
-    sleep(0.15)  # short priming sample: the first frame appears immediately with real data
+    raw = reading = screen = false
     try
+        raw = true
+        REPL.Terminals.raw!(term, true)
+        # Poll stdin on this task rather than blocking-read in a helper task: an orphaned
+        # blocked read would survive top() and swallow the first byte of every escape
+        # sequence the REPL receives afterwards.
+        reading = true
+        Base.start_reading(stdin)
+        queue = UInt8[]
+        screen = true
+        print(stdout, "\e[?1049h\e[?25l\e[2J")  # alternate screen, hide cursor
+        flush(stdout)
+        prev = _snapshot(full = true)
+        prevcores = Sys.cpu_info()
+        prevt = _monotime()
+        fr = nothing
+        lastrefresh = 0.0
+        sleep(0.15)  # short priming sample: the first frame appears immediately with real data
         while st.running
-            if !st.paused && time() - lastrefresh >= st.interval
+            if !st.paused && _monotime() - lastrefresh >= st.interval
                 snap = _snapshot(full = true)
                 cores = Sys.cpu_info()
-                t = time()
+                t = _monotime()
                 fr = _frame(prev, snap, prevcores, cores, max(t - prevt, 0.001))
                 prev, prevcores, prevt = snap, cores, t
                 lastrefresh = t
@@ -678,8 +712,8 @@ function top(; interval::Real = 2.0, tree::Bool = false)
                 _render(stdout, st, fr)
             end
             # wait for input or the next refresh tick
-            deadline = time() + 0.05
-            while time() < deadline && bytesavailable(stdin) == 0
+            deadline = _monotime() + 0.05
+            while _monotime() < deadline && bytesavailable(stdin) == 0
                 sleep(0.01)
             end
             bytesavailable(stdin) > 0 && append!(queue, readavailable(stdin))
@@ -688,37 +722,82 @@ function top(; interval::Real = 2.0, tree::Bool = false)
             end
         end
     finally
-        try
-            Base.stop_reading(stdin)
-        catch
+        if reading
+            try
+                Base.stop_reading(stdin)
+            catch
+            end
         end
-        print(stdout, "\e[?25h\e[?1049l")  # restore cursor and screen
-        REPL.Terminals.raw!(term, false)
+        if screen
+            try
+                print(stdout, "\e[?25h\e[?1049l")  # restore cursor and screen
+                flush(stdout)
+            catch
+            end
+        end
+        if raw
+            try
+                REPL.Terminals.raw!(term, false)
+            catch
+            end
+        end
     end
     return nothing
 end
 
-# Consume all buffered input bytes, assembling escape sequences (they arrive atomically
-# from readavailable). Returns true if anything was processed.
+# Return true once an incomplete escape sequence has waited long enough to be interpreted
+# as a bare Escape key.
+function _escape_timed_out!(st::TopState)
+    now = _monotime()
+    if st.escpending == 0.0
+        st.escpending = now
+        return false
+    end
+    return now - st.escpending >= 0.1
+end
+
+function _handle_bare_escape!(st::TopState)
+    if st.filtering
+        st.filtering = false
+        st.filter = ""
+    elseif st.help
+        st.help = false
+    end
+    return
+end
+
+# Consume complete buffered input sequences. Incomplete escape sequences remain in `queue`
+# because readavailable() may split one terminal keypress across multiple reads.
 function _drain_keys!(st::TopState, queue::Vector{UInt8}, fr)
     changed = false
     while !isempty(queue) && st.running
-        b = popfirst!(queue)
-        changed = true
-        if b == 0x1b
-            if !isempty(queue) && queue[1] == UInt8('[')
+        if queue[1] == 0x1b
+            if length(queue) == 1
+                _escape_timed_out!(st) || break
                 popfirst!(queue)
-                # consume a full CSI sequence: parameter bytes, then a final in 0x40-0x7e
-                params = UInt8[]
-                final = ' '
-                while !isempty(queue)
-                    b2 = popfirst!(queue)
-                    if 0x40 <= b2 <= 0x7e
-                        final = Char(b2)
-                        break
-                    end
-                    push!(params, b2)
+                st.escpending = 0.0
+                changed = true
+                _handle_bare_escape!(st)
+                continue
+            elseif queue[2] == UInt8('[')
+                finalindex = 3
+                while finalindex <= length(queue) &&
+                      !(0x40 <= queue[finalindex] <= 0x7e)
+                    finalindex += 1
                 end
+                if finalindex > length(queue)
+                    _escape_timed_out!(st) || break
+                    popfirst!(queue)
+                    st.escpending = 0.0
+                    changed = true
+                    _handle_bare_escape!(st)
+                    continue
+                end
+                seq = splice!(queue, 1:finalindex)
+                st.escpending = 0.0
+                changed = true
+                params = seq[3:end-1]
+                final = Char(seq[end])
                 ps = split(String(params), ';')
                 if st.help
                     st.help = false
@@ -738,18 +817,31 @@ function _drain_keys!(st::TopState, queue::Vector{UInt8}, fr)
                         _handle_key!(st, ch, fr)
                     end
                 end
-            elseif length(queue) >= 2 && queue[1] == UInt8('O')  # SS3 arrows (\eOA/\eOB)
-                popfirst!(queue)
-                k2 = Char(popfirst!(queue))
+            elseif queue[2] == UInt8('O')  # SS3 arrows (\eOA/\eOB)
+                if length(queue) < 3
+                    _escape_timed_out!(st) || break
+                    popfirst!(queue)
+                    st.escpending = 0.0
+                    changed = true
+                    _handle_bare_escape!(st)
+                    continue
+                end
+                seq = splice!(queue, 1:3)
+                st.escpending = 0.0
+                changed = true
+                k2 = Char(seq[3])
                 k2 == 'A' && (st.sel = max(st.sel - 1, 1))
                 k2 == 'B' && (st.sel += 1)
-            elseif st.filtering  # bare escape clears the filter
-                st.filtering = false
-                st.filter = ""
-            elseif st.help
-                st.help = false
+            else
+                popfirst!(queue)
+                st.escpending = 0.0
+                changed = true
+                _handle_bare_escape!(st)
             end
         else
+            st.escpending = 0.0
+            b = popfirst!(queue)
+            changed = true
             _handle_key!(st, Char(b), fr)
         end
     end
@@ -780,13 +872,14 @@ function _handle_key!(st::TopState, key::Char, fr)
     end
     if st.pendpid != 0  # kill confirmation
         if key == 'y'
-            ok = ccall(:kill, Cint, (Cint, Cint), st.pendpid, st.pendsig) == 0
-            st.message = ok ? "sent SIG$(st.pendsig == 9 ? "KILL" : "TERM") to $(st.pendpid)" :
-                              "kill $(st.pendpid) failed: $(Libc.strerror(Libc.errno()))"
+            ok, err = _send_signal(st.pendpid, st.pendsig, st.pendstart)
+            st.message = ok ?
+                "sent SIG$(st.pendsig == 9 ? "KILL" : "TERM") to $(st.pendpid)" : err
         else
             st.message = ""
         end
         st.pendpid = 0
+        st.pendstart = -1.0
         return
     end
     if st.filtering
@@ -846,9 +939,9 @@ function _handle_key!(st::TopState, key::Char, fr)
             r = rows[st.sel]
             if r.isjulia
                 sig = Sys.islinux() ? 10 : 29  # SIGUSR1 / SIGINFO: one-shot profile print
-                ok = ccall(:kill, Cint, (Cint, Cint), r.pid, sig) == 0
+                ok, err = _send_signal(r.pid, sig, get(fr.snap.start, r.pid, -1.0))
                 st.message = ok ? "asked $(r.pid) to print a profile to its stderr" :
-                                  "signal failed: $(Libc.strerror(Libc.errno()))"
+                                  err
             else
                 st.message = "$(r.pid) is not a Julia process"
             end
@@ -856,8 +949,10 @@ function _handle_key!(st::TopState, key::Char, fr)
     elseif (key == 'k' || key == 'K') && fr !== nothing
         rows = _rows(st, fr)
         if 1 <= st.sel <= length(rows)
-            st.pendpid = rows[st.sel].pid
+            row = rows[st.sel]
+            st.pendpid = row.pid
             st.pendsig = key == 'K' ? 9 : 15
+            st.pendstart = get(fr.snap.start, row.pid, -1.0)
         end
     end
     return
@@ -874,10 +969,10 @@ function top(io::IO; interval::Real = 0.5, tree::Bool = false, color::Bool = fal
     st = TopState(; interval, tree)
     prev = _snapshot(full = true)
     prevcores = Sys.cpu_info()
-    t0 = time()
+    t0 = _monotime()
     sleep(interval)
     snap = _snapshot(full = true)
-    fr = _frame(prev, snap, prevcores, Sys.cpu_info(), max(time() - t0, 0.001))
+    fr = _frame(prev, snap, prevcores, Sys.cpu_info(), max(_monotime() - t0, 0.001))
     _push_hist!(st, fr)
     return _render(io, st, fr; interactive = false, color)
 end

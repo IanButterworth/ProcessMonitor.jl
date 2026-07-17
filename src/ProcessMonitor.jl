@@ -45,6 +45,8 @@ Snapshot() = Snapshot(Dict{Int,Float64}(), Dict{Int,Int}(), Dict{Int,Int}(),
     Dict{Int,Vector{Int}}(), Dict{Int,Int}(), Dict{Int,String}(), Dict{Int,Int}(),
     Dict{Int,String}(), Dict{Int,String}(), Dict{Int,Float64}(), Dict{Int,Char}())
 
+_monotime() = time_ns() / 1e9
+
 # `full` additionally gathers executable paths and command lines (used by `top`); the
 # plain API skips them so samplers stay cheap.
 function _snapshot(; full::Bool = false)
@@ -328,6 +330,21 @@ function _checked_tree(snap::Snapshot, pid::Integer, recursive::Bool)
     return _tree(snap, Int(pid), recursive)
 end
 
+function _require_metric(pids, values, metric::AbstractString;
+        allow_globally_unavailable::Bool = false)
+    allow_globally_unavailable && isempty(values) && return pids
+    missing_index = findfirst(p -> !haskey(values, p), pids)
+    missing_index === nothing ||
+        throw(ArgumentError("$metric unavailable for process $(pids[missing_index])"))
+    return pids
+end
+
+function _checked_metric_tree(snap::Snapshot, pid::Integer, recursive::Bool, values,
+        metric::AbstractString; allow_globally_unavailable::Bool = false)
+    pids = _checked_tree(snap, pid, recursive)
+    return _require_metric(pids, values, metric; allow_globally_unavailable)
+end
+
 """
     CPUSampler(pid::Integer = getpid(); recursive::Bool = false)
     CPUSampler(p::Base.Process; recursive::Bool = false)
@@ -347,7 +364,7 @@ mutable struct CPUSampler
 end
 
 function CPUSampler(pid::Integer = getpid(); recursive::Bool = false)
-    return CPUSampler(Int(pid), recursive, _snapshot().cputime, time())
+    return CPUSampler(Int(pid), recursive, _snapshot().cputime, _monotime())
 end
 CPUSampler(p::Base.Process; recursive::Bool = false) = CPUSampler(getpid(p); recursive)
 
@@ -360,7 +377,7 @@ fully used on average over the interval; a process using several cores can excee
 """
 function cpu_percent(s::CPUSampler)
     snap = _snapshot()
-    now = time()
+    now = _monotime()
     dt = max(now - s.prev_t, eps())
     total = 0.0
     for p in _tree(snap, s.pid, s.recursive)
@@ -403,7 +420,8 @@ the time of the call. Throws `ArgumentError` if the process is not found or not 
 """
 function cpu_time(pid::Integer = getpid(); recursive::Bool = false)
     snap = _snapshot()
-    return sum(p -> get(snap.cputime, p, 0.0), _checked_tree(snap, pid, recursive))
+    pids = _checked_metric_tree(snap, pid, recursive, snap.cputime, "CPU time")
+    return sum(p -> snap.cputime[p], pids)
 end
 
 """
@@ -415,7 +433,8 @@ once per process). Throws `ArgumentError` if the process is not found or not acc
 """
 function rss(pid::Integer = getpid(); recursive::Bool = false)
     snap = _snapshot()
-    return sum(p -> get(snap.rss, p, 0), _checked_tree(snap, pid, recursive))
+    pids = _checked_metric_tree(snap, pid, recursive, snap.rss, "RSS")
+    return sum(p -> snap.rss[p], pids)
 end
 
 """
@@ -427,7 +446,9 @@ platforms where the thread count is unavailable (e.g. a BSD `ps` without `nlwp`)
 """
 function thread_count(pid::Integer = getpid(); recursive::Bool = false)
     snap = _snapshot()
-    return sum(p -> get(snap.threads, p, 0), _checked_tree(snap, pid, recursive))
+    pids = _checked_metric_tree(snap, pid, recursive, snap.threads, "thread count";
+        allow_globally_unavailable = true)
+    return sum(p -> get(snap.threads, p, 0), pids)
 end
 
 """
@@ -442,9 +463,12 @@ not accessible.
 function info(pid::Integer = getpid(); recursive::Bool = false)
     snap = _snapshot()
     pids = _checked_tree(snap, pid, recursive)
+    _require_metric(pids, snap.cputime, "CPU time")
+    _require_metric(pids, snap.rss, "RSS")
+    _require_metric(pids, snap.threads, "thread count"; allow_globally_unavailable = true)
     return (;
-        cpu_time = sum(p -> get(snap.cputime, p, 0.0), pids),
-        rss = sum(p -> get(snap.rss, p, 0), pids),
+        cpu_time = sum(p -> snap.cputime[p], pids),
+        rss = sum(p -> snap.rss[p], pids),
         threads = sum(p -> get(snap.threads, p, 0), pids),
         processes = length(pids),
     )
