@@ -49,7 +49,12 @@ function _snapshot_proc()
     hz = ccall(:sysconf, Clong, (Cint,), 2)  # _SC_CLK_TCK
     hz <= 0 && (hz = 100)
     pagesize = Int(ccall(:getpagesize, Cint, ()))
-    for name in readdir("/proc")
+    names = try
+        readdir("/proc")
+    catch
+        return s  # procfs not mounted
+    end
+    for name in names
         pid = tryparse(Int, name)
         pid === nothing && continue
         stat = try
@@ -103,8 +108,8 @@ function _snapshot_libproc()
             t = rb[]
             s.cputime[pid] = (t[3] + t[4]) * scale
         end
-        if ccall(:proc_pidinfo, Cint, (Cint, Cint, UInt64, Ptr{Cvoid}, Cint), pid, 4, 0, ti, 128) > 0
-            t = ti[]
+        if ccall(:proc_pidinfo, Cint, (Cint, Cint, UInt64, Ptr{Cvoid}, Cint), pid, 4, 0, ti, 128) >= 96
+            t = ti[]  # full 96-byte proc_taskinfo was filled
             s.rss[pid] = Int(t[2])              # pti_resident_size
             s.threads[pid] = Int(t[11] >> 32)   # pti_threadnum: 10th int32 after 6 uint64s
         end
@@ -135,6 +140,7 @@ function _snapshot_ps()
             secs = _parse_cpu_time(f[3])
             rsskb = tryparse(Int, f[4])
             (pid === nothing || ppid === nothing || secs === nothing) && continue
+            pid > 0 || continue  # e.g. the FreeBSD kernel is pid 0, its own parent
             s.cputime[pid] = secs
             rsskb === nothing || (s.rss[pid] = rsskb * 1024)
             if length(f) >= 5
@@ -171,12 +177,16 @@ function _parse_cpu_time(s)
 end
 
 # The pids of `root`'s subtree in `snap` (root first), or just `[root]` if not recursive.
+# Guards against ppid cycles (e.g. pid 0 is its own parent on some systems).
 function _tree(snap::Snapshot, root::Int, recursive::Bool)
     recursive || return [root]
     pids = Int[]
+    seen = Set{Int}()
     stack = [root]
     while !isempty(stack)
         p = pop!(stack)
+        p in seen && continue
+        push!(seen, p)
         push!(pids, p)
         append!(stack, get(snap.children, p, Int[]))
     end

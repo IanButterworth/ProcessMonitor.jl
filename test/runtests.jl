@@ -14,7 +14,21 @@ function start_ready(script)
     return p, out
 end
 
-stop(p, out) = (kill(p); wait(p); close(out))
+# Kill the process and any subprocesses it spawned (killing only the parent would orphan
+# e.g. IDLE_PARENT's spinning child), using the package's own process-tree snapshot.
+function stop(p, out)
+    pids = try
+        ProcessMonitor._tree(ProcessMonitor._snapshot(), getpid(p), true)
+    catch
+        Int[]
+    end
+    kill(p); wait(p)
+    for pid in pids
+        pid == getpid(p) && continue
+        ccall(:kill, Cint, (Cint, Cint), pid, 9)  # SIGKILL any orphaned descendants
+    end
+    close(out)
+end
 
 # Spins on the CPU forever; signals readiness once spinning.
 const SPIN = "println(\"READY\"); flush(stdout); while true; end"
@@ -129,10 +143,11 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
         end
 
         @testset "missing process throws" begin
-            # Find a pid that is not in use (probe with kill signal 0 via Libc).
+            # Find a pid that does not exist: kill(pid, 0) failing with ESRCH specifically
+            # (EPERM would mean the pid is alive but owned by another user).
             deadpid = 0
             for cand in 60_000:-1:50_000
-                if ccall(:kill, Cint, (Cint, Cint), cand, 0) != 0
+                if ccall(:kill, Cint, (Cint, Cint), cand, 0) != 0 && Libc.errno() == Libc.ESRCH
                     deadpid = cand
                     break
                 end
