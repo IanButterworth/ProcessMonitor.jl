@@ -47,6 +47,11 @@ Snapshot() = Snapshot(Dict{Int,Float64}(), Dict{Int,Int}(), Dict{Int,Int}(),
 
 _monotime() = time_ns() / 1e9
 
+# Linux and macOS expose stable process start times. BSD `ps` only exposes elapsed time
+# to one-second precision, so snapshots of the same process can differ slightly.
+_same_start(a::Real, b::Real) =
+    a > 0 && b > 0 && abs(a - b) <= ((Sys.islinux() || Sys.isapple()) ? 0.01 : 2.0)
+
 # `full` additionally gathers executable paths and command lines (used by `top`); the
 # plain API skips them so samplers stay cheap.
 function _snapshot(; full::Bool = false)
@@ -224,18 +229,18 @@ end
 function _snapshot_ps(full::Bool = false)
     s = Snapshot()
     # Separate `-o` flags (not `-o pid=,ppid=,...`): some BSD `ps` treat the text after
-    # the first `=` as a header, collapsing the output to one column. Full snapshots
-    # additionally request elapsed time and state, and `args` (the whole command line)
-    # instead of `comm`.
+    # the first `=` as a header, collapsing the output to one column. Every snapshot
+    # requests elapsed time so samplers can distinguish PID reuse. Full snapshots also
+    # request state and `args` (the whole command line) instead of `comm`.
     specs = if full
-        ((8, `-o pid= -o ppid= -o time= -o rss= -o uid= -o nlwp= -o etime= -o state= -o args=`),
-         (7, `-o pid= -o ppid= -o time= -o rss= -o uid= -o etime= -o state= -o args=`))
+        ((8, true, `-o pid= -o ppid= -o time= -o rss= -o uid= -o nlwp= -o etime= -o state= -o args=`),
+         (7, false, `-o pid= -o ppid= -o time= -o rss= -o uid= -o etime= -o state= -o args=`))
     else
-        ((6, `-o pid= -o ppid= -o time= -o rss= -o uid= -o nlwp= -o comm=`),
-         (5, `-o pid= -o ppid= -o time= -o rss= -o uid= -o comm=`))
+        ((7, true, `-o pid= -o ppid= -o time= -o rss= -o uid= -o nlwp= -o etime= -o comm=`),
+         (6, false, `-o pid= -o ppid= -o time= -o rss= -o uid= -o etime= -o comm=`))
     end
     nowt = time()
-    for (nnum, cols) in specs
+    for (nnum, hasthreads, cols) in specs
         raw = try
             read(`ps -A $cols`, String)
         catch
@@ -254,13 +259,13 @@ function _snapshot_ps(full::Bool = false)
             s.cputime[pid] = secs
             rsskb === nothing || (s.rss[pid] = rsskb * 1024)
             uid === nothing || (s.uid[pid] = uid)
-            if nnum == 6 || nnum == 8
+            if hasthreads
                 nthr = tryparse(Int, f[6])
                 nthr === nothing || (s.threads[pid] = nthr)
             end
+            elapsed = _parse_cpu_time(f[full ? nnum - 1 : nnum])
+            elapsed === nothing || (s.start[pid] = nowt - elapsed)
             if full
-                elapsed = _parse_cpu_time(f[nnum - 1])
-                elapsed === nothing || (s.start[pid] = nowt - elapsed)
                 isempty(f[nnum]) || (s.state[pid] = f[nnum][1])
             end
             if length(f) > nnum
@@ -355,16 +360,27 @@ previous call (or since construction for the first call).
 
 If `recursive` is `true`, CPU time spent in the process's subprocesses (recursively) is
 included, which is usually what accounts for utilization above 100%.
+
+Throws `ArgumentError` if the process is not found, cannot be inspected, or its identity
+cannot be established.
 """
 mutable struct CPUSampler
     pid::Int
     recursive::Bool
+    start::Float64
     prev::Dict{Int,Float64}
+    prev_start::Dict{Int,Float64}
     prev_t::Float64
 end
 
 function CPUSampler(pid::Integer = getpid(); recursive::Bool = false)
-    return CPUSampler(Int(pid), recursive, _snapshot().cputime, _monotime())
+    root = Int(pid)
+    snap = _snapshot()
+    haskey(snap.cputime, root) ||
+        throw(ArgumentError("process $pid not found or not accessible"))
+    start = get(snap.start, root, -1.0)
+    start > 0 || throw(ArgumentError("start time unavailable for process $pid"))
+    return CPUSampler(root, recursive, start, snap.cputime, snap.start, _monotime())
 end
 CPUSampler(p::Base.Process; recursive::Bool = false) = CPUSampler(getpid(p); recursive)
 
@@ -374,18 +390,26 @@ CPUSampler(p::Base.Process; recursive::Bool = false) = CPUSampler(getpid(p); rec
 Return the CPU utilization of `s`'s process since the previous `cpu_percent(s)` call (or
 since the sampler was constructed), and re-arm the sampler. `100.0` means one CPU core was
 fully used on average over the interval; a process using several cores can exceed `100.0`.
+Throws `ArgumentError` if the original process exited or its PID changed identity.
 """
 function cpu_percent(s::CPUSampler)
     snap = _snapshot()
     now = _monotime()
+    haskey(snap.cputime, s.pid) && _same_start(s.start, get(snap.start, s.pid, -1.0)) ||
+        throw(ArgumentError("process $(s.pid) exited or changed identity"))
     dt = max(now - s.prev_t, eps())
     total = 0.0
     for p in _tree(snap, s.pid, s.recursive)
         haskey(snap.cputime, p) || continue
-        d = snap.cputime[p] - get(s.prev, p, 0.0)
+        # A new descendant, or a reused descendant PID, has no valid baseline yet.
+        previous = haskey(s.prev, p) &&
+                   _same_start(get(s.prev_start, p, -1.0), get(snap.start, p, -1.0)) ?
+                   s.prev[p] : snap.cputime[p]
+        d = snap.cputime[p] - previous
         d > 0 && (total += d)
     end
     s.prev = snap.cputime
+    s.prev_start = snap.start
     s.prev_t = now
     return 100 * total / dt
 end
