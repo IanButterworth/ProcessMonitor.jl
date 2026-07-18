@@ -26,3 +26,22 @@ jobs:
       - uses: julia-actions/cache@a45e8fa8be21c18a06b7177052533149e61e9b38 # v3.1.0
       - uses: julia-actions/julia-buildpkg@e3eb439fad4f9aba7da2667e7510e4a46ebc46e1 # v1.7.0
       - uses: julia-actions/julia-runtest@6e050c8013b833b1195105ff2fce9cd802f53271 # v1.12.0
+
+  freebsd:
+    name: Julia - FreeBSD
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Test in FreeBSD
+        uses: vmactions/freebsd-vm@5a72679103d223925653750faa878a143340fbd0 # v1.5.0
+        with:
+          release: "14.3"
+          usesh: true
+          copyback: false
+          prepare: |
+            fetch -o /tmp/julia.tar.gz \
+              https://julialang-s3.julialang.org/bin/freebsd/x64/1.10/julia-1.10.11-freebsd-x86_64.tar.gz
+            sha256 -c 99ee7a28a35de5e2447875f0355893bd9f30149c908c56af48bd59e375a718e5 \
+              /tmp/julia.tar.gz
+            tar -xzf /tmp/julia.tar.gz -C /usr/local
+          run: /usr/local/julia-1.10.11/bin/julia --project --startup-file=no -e 'using Pkg; Pkg.test()'

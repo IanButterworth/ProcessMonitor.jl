@@ -2,13 +2,14 @@ using ProcessMonitor
 using Test
 
 const JULIA = Base.julia_cmd()[1]
+const TEST_MARKER = "PROCESSMONITOR_TEST_$(getpid())_$(time_ns())"
 
 # Start a Julia subprocess running `script` and return (process, io) only once the process
 # has printed "READY", i.e. once it is past startup. This keeps the subprocess's startup
 # CPU out of the measurement window so the tests aren't timing-dependent.
 function start_ready(script)
     out = Pipe()
-    p = run(pipeline(`$JULIA --startup-file=no -e $script`, stdout=out), wait=false)
+    p = run(pipeline(`$JULIA --startup-file=no -e $script $TEST_MARKER`, stdout=out), wait=false)
     close(out.in)
     readuntil(out, "READY")
     return p, out
@@ -37,7 +38,8 @@ function stop(p, out)
 end
 
 # Safety net at exit: descendants orphaned by a mid-test failure reparent to init and
-# leave our subtree, so find them by their unmistakable command line instead.
+# leave our subtree. Every subprocess receives a unique per-run command-line marker so
+# cleanup cannot match an unrelated Julia process or another concurrent test run.
 atexit() do
     snap = try
         ProcessMonitor._snapshot(full=true)
@@ -46,8 +48,7 @@ atexit() do
     end
     for (pid, cmd) in snap.cmd
         pid == getpid() && continue
-        if occursin("--startup-file=no -e while true; end", cmd) ||
-           (occursin("while true; end", cmd) && occursin("--startup-file=no", cmd))
+        if occursin(TEST_MARKER, cmd)
             ccall(:kill, Cint, (Cint, Cint), pid, 9)
         end
     end
@@ -57,7 +58,7 @@ end
 const SPIN = "println(\"READY\"); flush(stdout); while true; end"
 
 # Stays idle itself but spawns a spinning child; signals readiness once the child is spawned.
-const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while true; end"`, wait=false); println("READY"); flush(stdout); sleep(60)"""
+const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while true; end" $(ARGS[1])`, wait=false); println("READY"); flush(stdout); sleep(60)"""
 
 @testset "ProcessMonitor" begin
     @testset "_parse_cpu_time" begin
@@ -67,6 +68,16 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
         @test f("1:02:03") ≈ 3723.0
         @test f("2-03:00:00") ≈ 183600.0
         @test f("garbage") === nothing
+    end
+
+    @testset "metric availability" begin
+        snap = ProcessMonitor.Snapshot()
+        snap.cputime[7] = 1.0
+        @test_throws ArgumentError ProcessMonitor._checked_metric_tree(
+            snap, 7, false, snap.rss, "RSS")
+        @test ProcessMonitor._checked_metric_tree(
+            snap, 7, false, snap.threads, "thread count";
+            allow_globally_unavailable=true) == [7]
     end
 
     if Sys.iswindows()
@@ -220,8 +231,12 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             @test ProcessMonitor._julia_project("julia -e 1") == ""
 
             # start time and state are captured for ourselves
-            @test 0 < time() - get(snap.start, self, 0.0) < Sys.uptime() + 60
+            @test 0 < get(snap.start, self, 0.0) <= time()
             @test get(snap.state, self, ' ') in ('R', 'S', 'I')
+            @test ProcessMonitor._same_process(self, snap.start[self])
+            @test !ProcessMonitor._same_process(self, snap.start[self] - 10)
+            ok, msg = ProcessMonitor._send_signal(self, 0, snap.start[self])
+            @test ok && isempty(msg)
 
             # a cheap plain snapshot skips exe/cmd
             lean = ProcessMonitor._snapshot()
@@ -286,9 +301,37 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             @test st.sel == 4
             ProcessMonitor._drain_keys!(st, collect(codeunits("\eOB")), nothing)
             @test st.sel == 5
+            # Escape sequences may be split across terminal reads.
+            splitq = collect(codeunits("\e"))
+            @test !ProcessMonitor._drain_keys!(st, splitq, nothing)
+            @test splitq == collect(codeunits("\e"))
+            append!(splitq, codeunits("[A"))
+            @test ProcessMonitor._drain_keys!(st, splitq, nothing)
+            @test st.sel == 4 && isempty(splitq)
+            # A lone Escape is handled after the disambiguation timeout.
+            st.filtering = true
+            st.filter = "abc"
+            st.escpending = ProcessMonitor._monotime() - 1
+            ProcessMonitor._drain_keys!(st, collect(codeunits("\e")), nothing)
+            @test !st.filtering && isempty(st.filter)
             # CSI-u enter toggles the detail pane
             ProcessMonitor._drain_keys!(st, collect(codeunits("\e[13;1u")), nothing)
             @test st.detail
+        end
+
+        @testset "tree name sorting" begin
+            snap = ProcessMonitor.Snapshot()
+            for (pid, ppid, name) in ((1, 0, "root"), (3, 1, "zeta"), (2, 1, "alpha"))
+                snap.cputime[pid] = 0.0
+                snap.ppid[pid] = ppid
+                snap.name[pid] = name
+                push!(get!(snap.children, ppid, Int[]), pid)
+            end
+            fr = ProcessMonitor.Frame(snap, Dict{Int,Float64}(), Float64[], 0.0, 0.0,
+                (0.0, 0.0, 0.0), 0.0, 1, 0, 3, 0)
+            st = ProcessMonitor.TopState(tree=true, sortkey=:name, rev=false)
+            @test [row.name for row in ProcessMonitor._rows(st, fr)] ==
+                  ["root", "alpha", "zeta"]
         end
 
         @testset "missing process throws" begin
