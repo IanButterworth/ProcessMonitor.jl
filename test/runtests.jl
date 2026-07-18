@@ -119,12 +119,33 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             end
         end
 
+        @testset "recursive captures a newly spawned child" begin
+            bare = CPUSampler()
+            rec = CPUSampler(; recursive=true)
+            p, out = start_ready(SPIN)  # starts after both samplers recorded their baselines
+            try
+                sleep(2.5)
+                b, r = cpu_percent(bare), cpu_percent(rec)
+                @test r > b
+                @test r > 10
+            finally
+                stop(p, out)
+            end
+        end
+
         @testset "blocking convenience" begin
             p, out = start_ready(SPIN)
             try
                 @test cpu_percent(p; interval=2.5) > 10
             finally
                 stop(p, out)
+            end
+        end
+
+        @testset "interval validation" begin
+            for interval in (0.0, -1.0, NaN, Inf)
+                @test_throws ArgumentError cpu_percent(; interval)
+                @test_throws ArgumentError top(IOBuffer(); interval)
             end
         end
 
@@ -188,6 +209,20 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             @test occursin(string(getpid()), s)   # our own row is present
             @test occursin("CPU", s) && occursin("MEM", s)
             @test !occursin('\e', s)              # color=false → no escape codes
+
+            # expanded signal view fills the frame with high-resolution resource history
+            iog = IOBuffer()
+            ng = top(iog; interval=0.2, graphs=true)
+            sg = String(take!(iog))
+            graphlines = split(chomp(sg), '\n')
+            @test ng > 1
+            @test occursin("SIGNAL VIEW", sg)
+            @test occursin("CPU TOTAL", sg) && occursin("MEMORY", sg)
+            @test occursin("CORE TRAILS", sg) && occursin("C00", sg)
+            @test any(line -> any(ch -> '⠀' <= ch <= '⣿', line), graphlines)
+            @test length(graphlines) == 24
+            @test all(line -> textwidth(line) <= 80, graphlines)
+            @test !occursin('\e', sg)
 
             # tree mode nests our spawned child under its parent
             p, out = start_ready(IDLE_PARENT)
@@ -286,6 +321,26 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             iexe = findfirst(l -> occursin("exe ", l), dl)
             icmd = findfirst(l -> occursin("cmd ", l), dl)
             @test iexe !== nothing && icmd !== nothing && iexe < icmd
+
+            # graph histories retain a separate high-resolution trail for every core
+            graphstate = ProcessMonitor.TopState(graphs=true)
+            ProcessMonitor._push_hist!(graphstate, fr)
+            @test length(graphstate.corehist) == length(fr.percore)
+            @test all(history -> length(history) == 1, graphstate.corehist)
+            graphio = IOBuffer()
+            ProcessMonitor._render(
+                graphio, graphstate, fr; interactive=false, color=true)
+            colored = String(take!(graphio))
+            @test occursin("SIGNAL VIEW", colored) && occursin('\e', colored)
+            for (height, width) in ((14, 60), (18, 67), (24, 80), (32, 120))
+                sizebuf = IOBuffer()
+                sizeio = IOContext(sizebuf, :displaysize => (height, width))
+                ProcessMonitor._render(
+                    sizeio, graphstate, fr; interactive=false, color=false)
+                sizelines = split(chomp(String(take!(sizebuf))), '\n')
+                @test length(sizelines) == height
+                @test all(line -> textwidth(line) <= width, sizelines)
+            end
         end
 
         @testset "key decoding" begin
@@ -302,6 +357,18 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             @test st.sortkey === :time
             ProcessMonitor._drain_keys!(st, collect(codeunits("T")), nothing)
             @test !st.tree
+            ProcessMonitor._drain_keys!(st, collect(codeunits("g")), nothing)
+            @test st.graphs
+            ProcessMonitor._drain_keys!(st, collect(codeunits("g")), nothing)
+            @test !st.graphs
+            # selection starts above the first row; down enters and up leaves the table
+            @test st.sel == 0
+            ProcessMonitor._drain_keys!(st, collect(codeunits("\e[B")), nothing)
+            @test st.sel == 1
+            ProcessMonitor._drain_keys!(st, collect(codeunits("\e[A")), nothing)
+            @test st.sel == 0
+            ProcessMonitor._drain_keys!(st, collect(codeunits("\r")), nothing)
+            @test !st.detail
             # arrows: CSI and SS3 forms move the selection
             st.sel = 5
             ProcessMonitor._drain_keys!(st, collect(codeunits("\e[A")), nothing)
@@ -354,6 +421,29 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
                   ["root", "alpha", "zeta"]
         end
 
+        @testset "deep tree aggregation" begin
+            n = 3_000
+            snap = ProcessMonitor.Snapshot()
+            for pid in 1:n
+                parent = pid == 1 ? 0 : pid - 1
+                snap.cputime[pid] = 1.0
+                snap.rss[pid] = 2
+                snap.threads[pid] = 1
+                snap.ppid[pid] = parent
+                snap.name[pid] = "process"
+                push!(get!(snap.children, parent, Int[]), pid)
+            end
+            fr = ProcessMonitor.Frame(snap, Dict(pid => 1.0 for pid in 1:n),
+                Float64[], 0.0, 0.0, (0.0, 0.0, 0.0), 0.0, 1, 0, n, n)
+            st = ProcessMonitor.TopState(tree=true, aggregate=true, sortkey=:pid, rev=false)
+            rows = ProcessMonitor._rows(st, fr)
+            @test length(rows) == n
+            @test (rows[1].threads, rows[1].rss, rows[1].cpu, rows[1].time) ==
+                  (n, 2n, Float64(n), Float64(n))
+            @test (rows[end].threads, rows[end].rss, rows[end].cpu, rows[end].time) ==
+                  (1, 2, 1.0, 1.0)
+        end
+
         @testset "PID identity and stable selection" begin
             previous = ProcessMonitor.Snapshot()
             current = ProcessMonitor.Snapshot()
@@ -382,6 +472,9 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
                 Float64[], 0.0, 0.0, (0.0, 0.0, 0.0), 0.0, 1, 0, 2, 0)
             state = ProcessMonitor.TopState()
             rows1 = ProcessMonitor._rows(state, frame1)
+            ProcessMonitor._sync_selection!(state, rows1)
+            @test state.sel == 0 && state.selpid == 0
+            ProcessMonitor._select_row!(state, 1)
             ProcessMonitor._sync_selection!(state, rows1)
             @test state.sel == 1 && state.selpid == 11
             rows2 = ProcessMonitor._rows(state, frame2)

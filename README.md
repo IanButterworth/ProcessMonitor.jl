@@ -38,8 +38,9 @@ cpu_percent(s)   # => 96.3   (utilization since the last call)
 
 ### Blocking convenience
 
-Samples, sleeps `interval` seconds, samples again, and returns the utilization over that
-interval:
+Starts an interval timer, records the baseline, waits for the timer, and samples again.
+Starting the timer first keeps baseline collection from extending the requested period.
+The interval must be finite and greater than zero:
 
 ```julia
 cpu_percent(getpid(); recursive=true, interval=0.5)   # => 96.3
@@ -94,6 +95,9 @@ An `htop`-like view with some things `htop` doesn't have:
   test suite, `Distributed` workers, or precompilation fan-out.
 - **Braille history graphs** for system CPU and memory, per-process CPU sparklines on wide
   terminals, a per-core mini-bar row, and user/sys split CPU bars.
+- **Expanded signal view** (`g`): full-width, high-resolution Braille histories for total
+  CPU and memory, with live/average/peak context and adaptive colored trails for individual
+  cores.
 - **Process age and state columns** — sort by newest (`s`) to catch spawn storms; zombies
   and uninterruptible-sleep processes are color-coded.
 - **Detail pane** (`enter`): full command line, executable, start time, parent, fd count.
@@ -102,13 +106,17 @@ An `htop`-like view with some things `htop` doesn't have:
 - **Interval-accurate CPU%** from cumulative CPU-time differencing (the same portable
   method as the API), not a decaying average.
 
-Keys (`?` shows this in-app): `c`/`m`/`t`/`p`/`n`/`s` sort · `T` tree · `a` Σ rollup ·
+Keys (`?` shows this in-app): `g` expanded graphs · `c`/`m`/`t`/`p`/`n`/`s` sort ·
+`T` tree · `a` Σ rollup ·
 `j` julia-only · `C` command lines · `/` filter · `u` mine-only · `↑`/`↓` select ·
 `enter` detail · `k`/`K` SIGTERM/SIGKILL (with confirmation) · `P` profile · `+`/`-`
 interval · `space` pause · `q` quit.
 
+The process table starts with no selected row. Press `↓` to enter it; pressing `↑` from
+the first row returns to the unselected position.
+
 `top(io)` renders a single non-interactive frame to any `IO` (for logging or CI
-diagnostics); `top(io; tree=true)` for the tree form.
+diagnostics); use `tree=true` for the tree form or `graphs=true` for the signal view.
 
 ## Notes
 
