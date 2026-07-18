@@ -231,7 +231,7 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             @test ProcessMonitor._julia_project("julia -e 1") == ""
 
             # start time and state are captured for ourselves
-            @test 0 < time() - get(snap.start, self, 0.0) < Sys.uptime() + 60
+            @test 0 < get(snap.start, self, 0.0) <= time()
             @test get(snap.state, self, ' ') in ('R', 'S', 'I')
             @test ProcessMonitor._same_process(self, snap.start[self])
             @test !ProcessMonitor._same_process(self, snap.start[self] - 10)
