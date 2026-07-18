@@ -5,7 +5,7 @@ using Printf: @sprintf
 using Unicode
 
 const SPARK = ('▁', '▂', '▃', '▄', '▅', '▆', '▇', '█')
-const HIST_LEN = 240
+const HIST_LEN = 480
 
 Base.@kwdef mutable struct TopState
     sortkey::Symbol = :cpu   # :cpu, :mem, :pid, :time, :threads, :name, :age
@@ -16,9 +16,10 @@ Base.@kwdef mutable struct TopState
     mine::Bool = false       # only this uid's processes
     juliaonly::Bool = false  # only Julia processes
     showcmd::Bool = false    # show full command lines instead of names
+    graphs::Bool = false     # expanded CPU/memory signal view
     filter::String = ""
     filtering::Bool = false  # currently typing into the filter
-    sel::Int = 1             # selected row (1-based, into visible rows)
+    sel::Int = 0             # selected row (1-based), or 0 for no selection above row 1
     selpid::Int = 0          # selected process identity (0 until the first render)
     scroll::Int = 0
     paused::Bool = false
@@ -32,6 +33,7 @@ Base.@kwdef mutable struct TopState
     running::Bool = true
     cpuhist::Vector{Float64} = Float64[]
     memhist::Vector{Float64} = Float64[]
+    corehist::Vector{Vector{Float64}} = Vector{Float64}[]
     pidhist::Dict{Int,Vector{Float64}} = Dict{Int,Vector{Float64}}()
     message::String = ""     # transient status line (e.g. after a kill)
 end
@@ -151,6 +153,7 @@ function _fmtage(secs::Real)
 end
 
 _pctcolor(f) = f < 0.60 ? "\e[32m" : f < 0.85 ? "\e[33m" : "\e[31m"
+_memcolor(f) = f < 0.65 ? "\e[36m" : f < 0.85 ? "\e[35m" : "\e[31m"
 
 function _bar(frac::Float64, width::Int; color::Bool = true)
     frac = clamp(frac, 0.0, 1.0)
@@ -190,7 +193,8 @@ end
 # Braille history graph: `rows` text rows tall, two samples per character column, so a
 # 2-row graph has 8 vertical levels at twice the horizontal density of block sparklines.
 # Right-aligned (newest sample at the right edge). Returns one String per row, top first.
-function _braille(vals::Vector{Float64}, width::Int, rows::Int; color::Bool = true)
+function _braille(vals::Vector{Float64}, width::Int, rows::Int;
+        color::Bool = true, palette = _pctcolor)
     # dot bits per char: left column top→bottom, then right column top→bottom
     LEFT = (0x01, 0x02, 0x04, 0x40)
     RIGHT = (0x08, 0x10, 0x20, 0x80)
@@ -214,7 +218,7 @@ function _braille(vals::Vector{Float64}, width::Int, rows::Int; color::Bool = tr
                 b <= fl && (bits |= LEFT[d])
                 b <= fr && (bits |= RIGHT[d])
             end
-            color && print(lines[r], _pctcolor(peak))
+            color && print(lines[r], palette(peak))
             print(lines[r], Char(0x2800 + bits))
         end
     end
@@ -482,8 +486,11 @@ end
 
 function _sync_selection!(st::TopState, rows::Vector{Row})
     if isempty(rows)
-        st.sel = 1
+        st.sel = 0
         st.selpid = 0
+        return
+    end
+    if st.sel == 0 && st.selpid == 0
         return
     end
     if st.selpid != 0
@@ -496,7 +503,7 @@ function _sync_selection!(st::TopState, rows::Vector{Row})
 end
 
 function _select_row!(st::TopState, index::Integer)
-    st.sel = max(Int(index), 1)
+    st.sel = max(Int(index), 0)
     st.selpid = 0
     return
 end
@@ -615,6 +622,7 @@ const _HELP = """
   q / Ctrl-C   quit                     space        pause
   c m t p n s  sort: cpu, memory, cpu-time, pid, name, newest
   T            tree view                a            Σ roll subtrees up (tree)
+  g            expanded CPU/memory graphs
   j            only Julia processes     C            show full command lines
   /            filter (enter apply, esc clear)       u  only my processes
   ↑ ↓ PgUp PgDn  select                 enter        detail pane
@@ -625,7 +633,140 @@ const _HELP = """
 
 # ---- rendering ----
 
+function _history_stats(values::Vector{Float64})
+    isempty(values) && return (0.0, 0.0)
+    return sum(values) / length(values), maximum(values)
+end
+
+function _history_trend(values::Vector{Float64})
+    length(values) < 2 && return "·"
+    delta = values[end] - values[max(end - 3, 1)]
+    return delta > 0.02 ? "↑" : delta < -0.02 ? "↓" : "→"
+end
+
+function _axis_label(row::Int, rows::Int)
+    row == 1 && return "100%"
+    row == rows && return "  0%"
+    row == cld(rows, 2) && rows >= 5 && return " 50%"
+    return "    "
+end
+
+function _render_graph_view(io::IO, st::TopState, fr::Frame;
+        interactive::Bool = true, color::Bool = true)
+    rows_avail, width = displaysize(io)
+    height = max(rows_avail, 14)
+    width = max(width, 60)
+    buf = IOBuffer()
+    c(s) = color ? s : ""
+    interactive && print(buf, "\e[H")
+    eol = interactive ? "\e[K\n" : "\n"
+
+    syscpu = isempty(fr.percore) ? 0.0 : sum(fr.percore) / length(fr.percore)
+    memfrac = fr.memtotal > 0 ? fr.memused / fr.memtotal : 0.0
+    cpuavg, cpupeak = _history_stats(st.cpuhist)
+    memavg, mempeak = _history_stats(st.memhist)
+    ncores = length(fr.percore)
+
+    corecols = width >= 68 ? 2 : 1
+    maxcorerows = max(min(height ÷ 3, 8), 1)
+    corerows = ncores == 0 ? 1 : min(cld(ncores, corecols), maxcorerows)
+    graphspace = max(height - 5 - corerows, 4)
+    cpurows = graphspace ÷ 2
+    memrows = graphspace - cpurows
+    graphwidth = max(width - 6, 1)
+
+    header = string(" ProcessMonitor  ·  SIGNAL VIEW  ·  ", gethostname(),
+        "  ·  up ", _fmtuptime(fr.uptime),
+        @sprintf("  ·  load %.2f %.2f %.2f", fr.loadavg...),
+        st.paused ? "  ·  PAUSED" : "")
+    print(buf, c("\e[1;36m"), _ellipsize(header, width), c("\e[0m"), eol)
+
+    cpuheading = if width >= 88
+        @sprintf(" CPU TOTAL %s %5.1f%%   avg %5.1f%%   peak %5.1f%%   user %5.1f%%   sys %5.1f%%",
+            _history_trend(st.cpuhist), 100syscpu, 100cpuavg, 100cpupeak,
+            100fr.fuser, 100fr.fsys)
+    else
+        @sprintf(" CPU TOTAL %s %5.1f%%   user %5.1f%%   sys %5.1f%%",
+            _history_trend(st.cpuhist), 100syscpu, 100fr.fuser, 100fr.fsys)
+    end
+    print(buf, c("\e[1m"), c(_pctcolor(syscpu)), _ellipsize(cpuheading, width),
+        c("\e[0m"), eol)
+    cpugraph = _braille(st.cpuhist, graphwidth, cpurows; color)
+    for row in 1:cpurows
+        print(buf, c("\e[2m"), _axis_label(row, cpurows), " │", c("\e[0m"),
+            cpugraph[row], eol)
+    end
+
+    memheading = if width >= 88
+        @sprintf(" MEMORY    %s %5.1f%%   avg %5.1f%%   peak %5.1f%%   %s / %s",
+            _history_trend(st.memhist), 100memfrac, 100memavg, 100mempeak,
+            _fmtbytes(fr.memused), _fmtbytes(fr.memtotal))
+    else
+        @sprintf(" MEMORY    %s %5.1f%%   %s / %s",
+            _history_trend(st.memhist), 100memfrac,
+            _fmtbytes(fr.memused), _fmtbytes(fr.memtotal))
+    end
+    print(buf, c("\e[1m"), c(_memcolor(memfrac)), _ellipsize(memheading, width),
+        c("\e[0m"), eol)
+    memgraph = _braille(st.memhist, graphwidth, memrows; color, palette = _memcolor)
+    for row in 1:memrows
+        print(buf, c("\e[2m"), _axis_label(row, memrows), " │", c("\e[0m"),
+            memgraph[row], eol)
+    end
+
+    capacity = corecols * corerows
+    coreindices = if ncores <= capacity
+        collect(1:ncores)
+    else
+        sortperm(fr.percore; rev = true)[1:capacity]
+    end
+    coreheading = if ncores == 0
+        " CORE TRAILS   unavailable"
+    elseif ncores <= capacity
+        @sprintf(" CORE TRAILS   all %d cores   hottest %5.1f%%", ncores,
+            100maximum(fr.percore))
+    else
+        @sprintf(" CORE TRAILS   busiest %d / %d   hottest %5.1f%%", capacity, ncores,
+            100maximum(fr.percore))
+    end
+    print(buf, c("\e[1m"), _ellipsize(coreheading, width), c("\e[0m"), eol)
+
+    cellwidth = width ÷ corecols
+    for row in 1:corerows
+        for column in 1:corecols
+            position = (row - 1) * corecols + column
+            if position > length(coreindices)
+                print(buf, repeat(' ', cellwidth))
+                continue
+            end
+            index = coreindices[position]
+            usage = fr.percore[index]
+            label = @sprintf(" C%02d", index - 1)
+            percent = @sprintf("%5.1f%%", 100usage)
+            trailwidth = max(cellwidth - textwidth(label) - textwidth(percent) - 2, 1)
+            history = index <= length(st.corehist) ? st.corehist[index] : Float64[]
+            trail = _braille(history, trailwidth, 1; color)[1]
+            print(buf, label, " ", c(_pctcolor(usage)), percent, c("\e[0m"), " ", trail)
+            visible = textwidth(label) + textwidth(percent) + trailwidth + 2
+            print(buf, repeat(' ', max(cellwidth - visible, 0)))
+        end
+        print(buf, repeat(' ', width - cellwidth * corecols), eol)
+    end
+
+    if interactive
+        footer = string(" g processes   ? help   space pause   +/− interval   q quit",
+            "   ·   ", round(st.interval, digits = 1), "s cadence")
+        print(buf, c("\e[2m"), _ellipsize(footer, width), c("\e[0m"), "\e[K")
+    else
+        print(buf, c("\e[2m"), _ellipsize(" newest samples →", width), c("\e[0m"), eol)
+    end
+    write(io, take!(buf))
+    return length(_rows(st, fr))
+end
+
 function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, color::Bool = true)
+    st.graphs && !st.help &&
+        return _render_graph_view(io, st, fr; interactive, color)
     rows_avail, width = displaysize(io)
     height = max(rows_avail, 14)
     width = max(width, 60)
@@ -651,6 +792,7 @@ function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, colo
     st.juliaonly && push!(modes, "julia")
     st.mine && push!(modes, "mine")
     st.showcmd && push!(modes, "cmd")
+    st.graphs && push!(modes, "signals")
     isempty(st.filter) || push!(modes, "/" * st.filter)
     isempty(modes) || print(buf, c("\e[46;30m"), " ", join(modes, " · "), " ", c("\e[0m"))
     print(buf, eol)
@@ -710,7 +852,9 @@ function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, colo
     # Interactive mode fits the terminal; a single-frame dump includes every row.
     nbody = interactive ? max(height - 7 - detailh, 1) : length(rows)
     st.scroll = clamp(st.scroll, 0, max(length(rows) - nbody, 0))
-    if st.sel <= st.scroll
+    if st.sel == 0
+        st.scroll = 0
+    elseif st.sel <= st.scroll
         st.scroll = st.sel - 1
     elseif st.sel > st.scroll + nbody
         st.scroll = st.sel - nbody
@@ -783,7 +927,7 @@ function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, colo
             print(buf, c("\e[33m"), " ", st.message, c("\e[0m"), "\e[K")
         else
             print(buf, c("\e[2m"),
-                " q quit  ? help  c/m/t/p/n/s sort  T tree  a Σ  j julia  C cmd  / filter  ",
+                " q quit  ? help  g graphs  c/m/t/p/n/s sort  T tree  a Σ  j julia  C cmd  ",
                 "enter detail  k/K kill  P profile  (", round(st.interval, digits = 1), "s)",
                 c("\e[0m"), "\e[K")
         end
@@ -795,7 +939,7 @@ end
 # ---- interactive loop ----
 
 """
-    top(; interval::Real = 2.0, tree::Bool = false)
+    top(; interval::Real = 2.0, tree::Bool = false, graphs::Bool = false)
 
 An interactive, `htop`-like view of the system's processes, built on the same snapshot
 machinery as the rest of the package. Requires an interactive terminal; `top(io)` renders
@@ -806,13 +950,14 @@ The header shows system CPU (user green / sys red) and memory with braille histo
 graphs, one mini-bar per core, load averages, uptime, process/thread totals, and a rollup
 of all Julia processes (count, CPU, memory, threads). Julia rows are highlighted and
 labeled with version (from the install path), role (`worker`, `precompile`) and
-`--project`. Press `?` for the key reference.
+`--project`. Press `g` for the expanded CPU/memory signal view and `?` for the key
+reference.
 """
-function top(; interval::Real = 2.0, tree::Bool = false)
+function top(; interval::Real = 2.0, tree::Bool = false, graphs::Bool = false)
     Sys.iswindows() && error("ProcessMonitor: Windows is not yet supported")
     stdout isa Base.TTY || error("top() needs an interactive terminal; use top(io) for one frame")
     interval = _validated_interval(interval)
-    st = TopState(; interval, tree)
+    st = TopState(; interval, tree, graphs)
     term = REPL.Terminals.TTYTerminal(get(ENV, "TERM", ""), stdin, stdout, stderr)
     raw = reading = screen = false
     try
@@ -1019,6 +1164,14 @@ function _push_hist!(st::TopState, fr::Frame)
     push!(st.memhist, fr.memtotal > 0 ? fr.memused / fr.memtotal : 0.0)
     length(st.cpuhist) > HIST_LEN && popfirst!(st.cpuhist)
     length(st.memhist) > HIST_LEN && popfirst!(st.memhist)
+    while length(st.corehist) < length(fr.percore)
+        push!(st.corehist, Float64[])
+    end
+    resize!(st.corehist, length(fr.percore))
+    for (i, usage) in enumerate(fr.percore)
+        push!(st.corehist[i], usage)
+        length(st.corehist[i]) > HIST_LEN && popfirst!(st.corehist[i])
+    end
     for (pid, pct) in fr.cpupct
         h = get!(() -> Float64[], st.pidhist, pid)
         push!(h, pct / 100)  # scaled so 1.0 == one full core
@@ -1055,7 +1208,7 @@ function _handle_key!(st::TopState, key::Char, fr)
         elseif isprint(key)
             st.filter *= key
         end
-        _select_row!(st, 1)
+        _select_row!(st, 0)
         return
     end
     if key == 'q' || key == '\x03'
@@ -1064,7 +1217,9 @@ function _handle_key!(st::TopState, key::Char, fr)
         st.help = true
     elseif key == ' '
         st.paused = !st.paused
-    elseif key == '\r' || key == '\n'
+    elseif key == 'g'
+        st.graphs = !st.graphs
+    elseif (key == '\r' || key == '\n') && st.sel > 0
         st.detail = !st.detail
     elseif key == 'c'
         st.sortkey = :cpu; st.rev = true
@@ -1080,20 +1235,21 @@ function _handle_key!(st::TopState, key::Char, fr)
         st.sortkey = :name; st.rev = false
     elseif key == 'T'
         st.tree = !st.tree
-        _select_row!(st, 1)
+        _select_row!(st, 0)
     elseif key == 'a'
         st.aggregate = !st.aggregate
     elseif key == 'u'
         st.mine = !st.mine
-        _select_row!(st, 1)
+        _select_row!(st, 0)
     elseif key == 'j'
         st.juliaonly = !st.juliaonly
-        _select_row!(st, 1)
+        _select_row!(st, 0)
     elseif key == 'C'
         st.showcmd = !st.showcmd
     elseif key == '/'
         st.filtering = true
         st.filter = ""
+        _select_row!(st, 0)
     elseif key == '+'
         st.interval = min(st.interval * 2, 60.0)
     elseif key == '-'
@@ -1126,16 +1282,18 @@ function _handle_key!(st::TopState, key::Char, fr)
 end
 
 """
-    top(io::IO; interval::Real = 0.5, tree::Bool = false, color::Bool = false)
+    top(io::IO; interval::Real = 0.5, tree::Bool = false, graphs::Bool = false,
+        color::Bool = false)
 
 Render one frame of the process view to `io` (sampling CPU over `interval` seconds) and
 return the number of process rows. Non-interactive; useful for logging and testing.
 `interval` must be finite and greater than zero.
 """
-function top(io::IO; interval::Real = 0.5, tree::Bool = false, color::Bool = false)
+function top(io::IO; interval::Real = 0.5, tree::Bool = false, graphs::Bool = false,
+        color::Bool = false)
     Sys.iswindows() && error("ProcessMonitor: Windows is not yet supported")
     interval = _validated_interval(interval)
-    st = TopState(; interval, tree)
+    st = TopState(; interval, tree, graphs)
     timer = Timer(interval)
     try
         prev = _snapshot(full = true)
@@ -1158,6 +1316,7 @@ if ccall(:jl_generating_output, Cint, ()) == 1 && !Sys.iswindows()
         try
             top(io; interval = 0.01)
             top(io; interval = 0.01, tree = true, color = true)
+            top(io; interval = 0.01, graphs = true, color = true)
         catch
         end
     end
