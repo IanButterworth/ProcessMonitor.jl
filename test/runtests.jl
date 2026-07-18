@@ -91,8 +91,8 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
         # subtree with a busy child always out-uses the idle parent alone.
         @testset "busy out-uses idle" begin
             p, out = start_ready(SPIN)
+            busy = CPUSampler(p)
             try
-                busy = CPUSampler(p)
                 idle = CPUSampler()   # this test process, mostly sleeping
                 sleep(2.5)
                 b, i = cpu_percent(busy), cpu_percent(idle)
@@ -101,6 +101,7 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             finally
                 stop(p, out)
             end
+            @test_throws ArgumentError cpu_percent(busy)
         end
 
         @testset "recursive captures subprocess CPU" begin
@@ -241,6 +242,7 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             # a cheap plain snapshot skips exe/cmd
             lean = ProcessMonitor._snapshot()
             @test isempty(lean.exe) && isempty(lean.cmd)
+            @test 0 < get(lean.start, self, 0.0) <= time()
         end
 
         @testset "formatting helpers" begin
@@ -263,8 +265,13 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
 
             w = ProcessMonitor._wrap(" cmd  ", repeat("x", 200), 40)
             @test length(w) > 1                       # wrapped across rows
-            @test all(l -> length(l) <= 40, w)        # each row fits
+            @test all(l -> textwidth(l) <= 40, w)      # each row fits
             @test startswith(w[2], "      ")          # continuation indented under label
+            @test textwidth(ProcessMonitor._ellipsize("界界", 2)) == 2
+            combined = ProcessMonitor._ellipsize("e\u0301", 2)
+            @test startswith(combined, "e\u0301") && textwidth(combined) == 2
+            wide = ProcessMonitor._wrap(" cmd  ", repeat("界", 30), 20)
+            @test length(wide) > 1 && all(l -> textwidth(l) <= 20, wide)
             @test ProcessMonitor._strip_argv0("/bin/julia --project=X -e 1") == "--project=X -e 1"
             @test ProcessMonitor._strip_argv0("solo") == ""
 
@@ -317,6 +324,19 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             # CSI-u enter toggles the detail pane
             ProcessMonitor._drain_keys!(st, collect(codeunits("\e[13;1u")), nothing)
             @test st.detail
+
+            # UTF-8 characters may also be split across terminal reads.
+            utf = ProcessMonitor.TopState(filtering=true)
+            encoded = collect(codeunits("é"))
+            utfq = encoded[1:1]
+            @test !ProcessMonitor._drain_keys!(utf, utfq, nothing)
+            @test isempty(utf.filter) && utfq == encoded[1:1]
+            append!(utfq, encoded[2:end])
+            @test ProcessMonitor._drain_keys!(utf, utfq, nothing)
+            @test utf.filter == "é" && isempty(utfq)
+            ProcessMonitor._drain_keys!(utf, collect(codeunits("e\u0301")), nothing)
+            ProcessMonitor._drain_keys!(utf, UInt8[0x7f], nothing)
+            @test utf.filter == "é"  # backspace removes the last grapheme, not one codepoint
         end
 
         @testset "tree name sorting" begin
@@ -334,6 +354,44 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
                   ["root", "alpha", "zeta"]
         end
 
+        @testset "PID identity and stable selection" begin
+            previous = ProcessMonitor.Snapshot()
+            current = ProcessMonitor.Snapshot()
+            previous.cputime[7] = 10.0
+            current.cputime[7] = 11.0
+            previous.start[7] = 100.0
+            current.start[7] = 100.0
+            same = ProcessMonitor._frame(previous, current, Any[], Any[], 2.0)
+            @test same.cpupct[7] ≈ 50.0
+            current.start[7] = 110.0
+            reused = ProcessMonitor._frame(previous, current, Any[], Any[], 2.0)
+            @test reused.cpupct[7] == 0.0
+
+            sampler = CPUSampler()
+            sampler.start -= 10
+            @test_throws ArgumentError cpu_percent(sampler)
+
+            snap = ProcessMonitor.Snapshot()
+            for (pid, name) in ((11, "one"), (22, "two"))
+                snap.cputime[pid] = 1.0
+                snap.name[pid] = name
+            end
+            frame1 = ProcessMonitor.Frame(snap, Dict(11 => 20.0, 22 => 10.0),
+                Float64[], 0.0, 0.0, (0.0, 0.0, 0.0), 0.0, 1, 0, 2, 0)
+            frame2 = ProcessMonitor.Frame(snap, Dict(11 => 5.0, 22 => 30.0),
+                Float64[], 0.0, 0.0, (0.0, 0.0, 0.0), 0.0, 1, 0, 2, 0)
+            state = ProcessMonitor.TopState()
+            rows1 = ProcessMonitor._rows(state, frame1)
+            ProcessMonitor._sync_selection!(state, rows1)
+            @test state.sel == 1 && state.selpid == 11
+            rows2 = ProcessMonitor._rows(state, frame2)
+            ProcessMonitor._sync_selection!(state, rows2)
+            @test state.sel == 2 && state.selpid == 11
+            ProcessMonitor._select_row!(state, 1)
+            ProcessMonitor._sync_selection!(state, rows2)
+            @test state.sel == 1 && state.selpid == 22
+        end
+
         @testset "missing process throws" begin
             # Find a pid that does not exist: kill(pid, 0) failing with ESRCH specifically
             # (EPERM would mean the pid is alive but owned by another user).
@@ -345,6 +403,7 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
                 end
             end
             @test deadpid != 0
+            @test_throws ArgumentError CPUSampler(deadpid)
             @test_throws ArgumentError rss(deadpid)
             @test_throws ArgumentError ProcessMonitor.info(deadpid)
         end

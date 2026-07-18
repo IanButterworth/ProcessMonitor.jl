@@ -2,6 +2,7 @@
 
 import REPL
 using Printf: @sprintf
+using Unicode
 
 const SPARK = ('▁', '▂', '▃', '▄', '▅', '▆', '▇', '█')
 const HIST_LEN = 240
@@ -18,6 +19,7 @@ Base.@kwdef mutable struct TopState
     filter::String = ""
     filtering::Bool = false  # currently typing into the filter
     sel::Int = 1             # selected row (1-based, into visible rows)
+    selpid::Int = 0          # selected process identity (0 until the first render)
     scroll::Int = 0
     paused::Bool = false
     detail::Bool = false     # show the detail pane for the selection
@@ -57,7 +59,11 @@ _cpu_uis(c) = (
 function _frame(prev::Snapshot, snap::Snapshot, prevcores, cores, dt::Float64)
     cpupct = Dict{Int,Float64}()
     for (pid, t) in snap.cputime
-        d = t - get(prev.cputime, pid, t)  # unseen pid: no baseline, report 0 not a spike
+        # New and reused PIDs have no valid baseline, so report zero for their first frame.
+        previous = haskey(prev.cputime, pid) &&
+                   _same_start(get(prev.start, pid, -1.0), get(snap.start, pid, -1.0)) ?
+                   prev.cputime[pid] : t
+        d = t - previous
         cpupct[pid] = 100 * max(d, 0.0) / dt
     end
     percore = Float64[]
@@ -223,8 +229,25 @@ function _username(uid::Int)
     end
 end
 
-_ellipsize(s::AbstractString, w::Int) =
-    textwidth(s) <= w ? rpad(s, w) : first(s, max(w - 1, 0)) * "…"
+_pad_display(s::AbstractString, w::Int) =
+    String(s) * repeat(' ', max(w - textwidth(s), 0))
+
+function _ellipsize(s::AbstractString, w::Int)
+    w = max(w, 0)
+    textwidth(s) <= w && return _pad_display(s, w)
+    w == 0 && return ""
+    marker = "…"
+    available = max(w - textwidth(marker), 0)
+    io = IOBuffer()
+    used = 0
+    for grapheme in Unicode.graphemes(s)
+        gw = textwidth(grapheme)
+        used + gw <= available || break
+        print(io, grapheme)
+        used += gw
+    end
+    return _pad_display(String(take!(io)) * marker, w)
+end
 
 # ---- Julia awareness ----
 
@@ -384,6 +407,27 @@ function _rows(st::TopState, fr::Frame)
     return rows
 end
 
+function _sync_selection!(st::TopState, rows::Vector{Row})
+    if isempty(rows)
+        st.sel = 1
+        st.selpid = 0
+        return
+    end
+    if st.selpid != 0
+        index = findfirst(r -> r.pid == st.selpid, rows)
+        index === nothing || (st.sel = index)
+    end
+    st.sel = clamp(st.sel, 1, length(rows))
+    st.selpid = rows[st.sel].pid
+    return
+end
+
+function _select_row!(st::TopState, index::Integer)
+    st.sel = max(Int(index), 1)
+    st.selpid = 0
+    return
+end
+
 # ---- detail pane ----
 
 function _fdcount(pid::Int)
@@ -402,8 +446,8 @@ function _fdcount(pid::Int)
 end
 
 # A displayed PID may have exited and been reused before the user confirms an action.
-# Full BSD snapshots estimate start time from second-resolution elapsed time, hence the
-# small tolerance; Linux and macOS start times are stable within it.
+# BSD snapshots estimate start time from second-resolution elapsed time; `_same_start`
+# accounts for that limited precision.
 function _same_process(pid::Integer, expected_start::Float64)
     expected_start > 0 || return false
     pid = Int(pid)
@@ -413,7 +457,7 @@ function _same_process(pid::Integer, expected_start::Float64)
         return false
     end
     current_start = get(snap.start, pid, -1.0)
-    return current_start > 0 && abs(current_start - expected_start) <= 2.0
+    return _same_start(current_start, expected_start)
 end
 
 function _send_signal(pid::Integer, sig::Integer, expected_start::Float64)
@@ -428,15 +472,30 @@ end
 # a long value stays fully readable across several rows.
 function _wrap(label::AbstractString, text::AbstractString, width::Int)
     width = max(width, 16)
-    indent = repeat(' ', min(length(label), width - 8))
-    chars = collect(label * text)
+    indent = repeat(' ', min(textwidth(label), width - 8))
+    graphemes = collect(Unicode.graphemes(label * text))
     out = String[]
     i, firstline = 1, true
-    while i <= length(chars)
-        cap = max(firstline ? width : width - length(indent), 1)
-        j = min(i + cap - 1, length(chars))
-        push!(out, (firstline ? "" : indent) * String(chars[i:j]))
-        i, firstline = j + 1, false
+    while i <= length(graphemes)
+        prefix = firstline ? "" : indent
+        cap = max(width - textwidth(prefix), 1)
+        io = IOBuffer()
+        used = 0
+        j = i
+        while j <= length(graphemes)
+            gw = textwidth(graphemes[j])
+            used + gw <= cap || break
+            print(io, graphemes[j])
+            used += gw
+            j += 1
+        end
+        # `width` is at least 16, so this is only relevant to unusually wide graphemes.
+        if j == i
+            print(io, graphemes[j])
+            j += 1
+        end
+        push!(out, prefix * String(take!(io)))
+        i, firstline = j, false
     end
     isempty(out) && push!(out, String(label))
     return out
@@ -567,7 +626,7 @@ function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, colo
         c("\e[0m"), eol)
 
     rows = _rows(st, fr)
-    st.sel = clamp(st.sel, 1, max(length(rows), 1))
+    _sync_selection!(st, rows)
     # The detail pane wraps exe/cmd, so its height is dynamic; compute it before the body
     # so the process list gets the remaining rows. Cap it at half the screen.
     detaillines = String[]
@@ -611,7 +670,7 @@ function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, colo
             statecol = r.state == 'Z' ? "\e[31m" : r.state == 'D' ? "\e[33m" : "\e[2m"
             print(buf, lpad(r.pid, 7), " ",
                 c(r.uid == Int(ccall(:getuid, Cuint, ())) ? "\e[36m" : "\e[2m"),
-                rpad(_ellipsize(r.uid < 0 ? "?" : _username(r.uid), 8), 8), c("\e[0m"),
+                _ellipsize(r.uid < 0 ? "?" : _username(r.uid), 8), c("\e[0m"),
                 selected ? c("\e[7m") : "", " ",
                 c(selected ? "" : statecol), r.state, c(selected ? "" : "\e[0m"),
                 selected ? "" : "", " ",
@@ -766,8 +825,34 @@ function _handle_bare_escape!(st::TopState)
     return
 end
 
+function _pop_utf8_char!(queue::Vector{UInt8})
+    b = queue[1]
+    nbytes = b <= 0x7f ? 1 :
+             0xc2 <= b <= 0xdf ? 2 :
+             0xe0 <= b <= 0xef ? 3 :
+             0xf0 <= b <= 0xf4 ? 4 : 0
+    if nbytes == 0
+        popfirst!(queue)
+        return true, nothing
+    end
+    length(queue) >= nbytes || return false, nothing
+    encoded = String(copy(queue[1:nbytes]))
+    if !isvalid(encoded) || length(encoded) != 1
+        popfirst!(queue)
+        return true, nothing
+    end
+    splice!(queue, 1:nbytes)
+    return true, first(encoded)
+end
+
+function _drop_last_grapheme(s::AbstractString)
+    graphemes = collect(Unicode.graphemes(s))
+    isempty(graphemes) || pop!(graphemes)
+    return join(graphemes)
+end
+
 # Consume complete buffered input sequences. Incomplete escape sequences remain in `queue`
-# because readavailable() may split one terminal keypress across multiple reads.
+# because readavailable() may split one terminal keypress or UTF-8 character across reads.
 function _drain_keys!(st::TopState, queue::Vector{UInt8}, fr)
     changed = false
     while !isempty(queue) && st.running
@@ -802,11 +887,11 @@ function _drain_keys!(st::TopState, queue::Vector{UInt8}, fr)
                 if st.help
                     st.help = false
                 elseif final == 'A'
-                    st.sel = max(st.sel - 1, 1)
+                    _select_row!(st, st.sel - 1)
                 elseif final == 'B'
-                    st.sel += 1  # clamped in render
+                    _select_row!(st, st.sel + 1)  # clamped in render
                 elseif final == '~' && !isempty(ps) && (ps[1] == "5" || ps[1] == "6")
-                    st.sel = ps[1] == "5" ? max(st.sel - 20, 1) : st.sel + 20
+                    _select_row!(st, ps[1] == "5" ? st.sel - 20 : st.sel + 20)
                 elseif final == 'u'  # CSI-u (modifyOtherKeys): "code;modifiers u"
                     code = isempty(ps) ? nothing : tryparse(Int, ps[1])
                     mods = length(ps) >= 2 ? something(tryparse(Int, ps[2]), 1) : 1
@@ -830,8 +915,8 @@ function _drain_keys!(st::TopState, queue::Vector{UInt8}, fr)
                 st.escpending = 0.0
                 changed = true
                 k2 = Char(seq[3])
-                k2 == 'A' && (st.sel = max(st.sel - 1, 1))
-                k2 == 'B' && (st.sel += 1)
+                k2 == 'A' && _select_row!(st, st.sel - 1)
+                k2 == 'B' && _select_row!(st, st.sel + 1)
             else
                 popfirst!(queue)
                 st.escpending = 0.0
@@ -840,9 +925,10 @@ function _drain_keys!(st::TopState, queue::Vector{UInt8}, fr)
             end
         else
             st.escpending = 0.0
-            b = popfirst!(queue)
+            complete, key = _pop_utf8_char!(queue)
+            complete || break
             changed = true
-            _handle_key!(st, Char(b), fr)
+            key === nothing || _handle_key!(st, key, fr)
         end
     end
     return changed
@@ -886,11 +972,11 @@ function _handle_key!(st::TopState, key::Char, fr)
         if key == '\r' || key == '\n'
             st.filtering = false
         elseif key == '\x7f' || key == '\b'
-            isempty(st.filter) || (st.filter = st.filter[1:prevind(st.filter, end)])
+            st.filter = _drop_last_grapheme(st.filter)
         elseif isprint(key)
             st.filter *= key
         end
-        st.sel = 1
+        _select_row!(st, 1)
         return
     end
     if key == 'q' || key == '\x03'
@@ -915,15 +1001,15 @@ function _handle_key!(st::TopState, key::Char, fr)
         st.sortkey = :name; st.rev = false
     elseif key == 'T'
         st.tree = !st.tree
-        st.sel = 1
+        _select_row!(st, 1)
     elseif key == 'a'
         st.aggregate = !st.aggregate
     elseif key == 'u'
         st.mine = !st.mine
-        st.sel = 1
+        _select_row!(st, 1)
     elseif key == 'j'
         st.juliaonly = !st.juliaonly
-        st.sel = 1
+        _select_row!(st, 1)
     elseif key == 'C'
         st.showcmd = !st.showcmd
     elseif key == '/'
@@ -935,6 +1021,7 @@ function _handle_key!(st::TopState, key::Char, fr)
         st.interval = max(st.interval / 2, 0.25)
     elseif key == 'P' && fr !== nothing
         rows = _rows(st, fr)
+        _sync_selection!(st, rows)
         if 1 <= st.sel <= length(rows)
             r = rows[st.sel]
             if r.isjulia
@@ -948,6 +1035,7 @@ function _handle_key!(st::TopState, key::Char, fr)
         end
     elseif (key == 'k' || key == 'K') && fr !== nothing
         rows = _rows(st, fr)
+        _sync_selection!(st, rows)
         if 1 <= st.sel <= length(rows)
             row = rows[st.sel]
             st.pendpid = row.pid
