@@ -119,12 +119,33 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             end
         end
 
+        @testset "recursive captures a newly spawned child" begin
+            bare = CPUSampler()
+            rec = CPUSampler(; recursive=true)
+            p, out = start_ready(SPIN)  # starts after both samplers recorded their baselines
+            try
+                sleep(2.5)
+                b, r = cpu_percent(bare), cpu_percent(rec)
+                @test r > b
+                @test r > 10
+            finally
+                stop(p, out)
+            end
+        end
+
         @testset "blocking convenience" begin
             p, out = start_ready(SPIN)
             try
                 @test cpu_percent(p; interval=2.5) > 10
             finally
                 stop(p, out)
+            end
+        end
+
+        @testset "interval validation" begin
+            for interval in (0.0, -1.0, NaN, Inf)
+                @test_throws ArgumentError cpu_percent(; interval)
+                @test_throws ArgumentError top(IOBuffer(); interval)
             end
         end
 
@@ -352,6 +373,29 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             st = ProcessMonitor.TopState(tree=true, sortkey=:name, rev=false)
             @test [row.name for row in ProcessMonitor._rows(st, fr)] ==
                   ["root", "alpha", "zeta"]
+        end
+
+        @testset "deep tree aggregation" begin
+            n = 3_000
+            snap = ProcessMonitor.Snapshot()
+            for pid in 1:n
+                parent = pid == 1 ? 0 : pid - 1
+                snap.cputime[pid] = 1.0
+                snap.rss[pid] = 2
+                snap.threads[pid] = 1
+                snap.ppid[pid] = parent
+                snap.name[pid] = "process"
+                push!(get!(snap.children, parent, Int[]), pid)
+            end
+            fr = ProcessMonitor.Frame(snap, Dict(pid => 1.0 for pid in 1:n),
+                Float64[], 0.0, 0.0, (0.0, 0.0, 0.0), 0.0, 1, 0, n, n)
+            st = ProcessMonitor.TopState(tree=true, aggregate=true, sortkey=:pid, rev=false)
+            rows = ProcessMonitor._rows(st, fr)
+            @test length(rows) == n
+            @test (rows[1].threads, rows[1].rss, rows[1].cpu, rows[1].time) ==
+                  (n, 2n, Float64(n), Float64(n))
+            @test (rows[end].threads, rows[end].rss, rows[end].cpu, rows[end].time) ==
+                  (1, 2, 1.0, 1.0)
         end
 
         @testset "PID identity and stable selection" begin

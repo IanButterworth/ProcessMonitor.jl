@@ -38,8 +38,9 @@ cpu_percent(s)   # => 96.3   (utilization since the last call)
 
 ### Blocking convenience
 
-Samples, sleeps `interval` seconds, samples again, and returns the utilization over that
-interval:
+Starts an interval timer, records the baseline, waits for the timer, and samples again.
+Starting the timer first keeps baseline collection from extending the requested period.
+The interval must be finite and greater than zero:
 
 ```julia
 cpu_percent(getpid(); recursive=true, interval=0.5)   # => 96.3

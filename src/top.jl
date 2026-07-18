@@ -332,19 +332,33 @@ _sortval(st::TopState, r::Row) =
     st.sortkey === :age ? -r.age :
     st.sortkey === :threads ? Float64(r.threads) : 0.0
 
-function _mkrow(fr::Frame, pid::Int, prefix::String, agg::Bool)
+struct _Usage
+    threads::Int
+    rss::Int
+    cpu::Float64
+    time::Float64
+end
+
+_own_usage(fr::Frame, pid::Int) = _Usage(
+    get(fr.snap.threads, pid, 0),
+    get(fr.snap.rss, pid, 0),
+    get(fr.cpupct, pid, 0.0),
+    get(fr.snap.cputime, pid, 0.0),
+)
+
+function _mkrow(fr::Frame, pid::Int, prefix::String, usage::Union{Nothing,_Usage} = nothing)
     snap = fr.snap
-    pids = agg ? _tree(snap, pid, true) : (pid,)
+    usage === nothing && (usage = _own_usage(fr, pid))
     isjulia = _isjulia(snap, pid)
     cmd = get(snap.cmd, pid, "")
     start = get(snap.start, pid, -1.0)
     return Row(pid, prefix,
         get(snap.name, pid, "?"),
         get(snap.uid, pid, -1),
-        sum(p -> get(snap.threads, p, 0), pids),
-        sum(p -> get(snap.rss, p, 0), pids),
-        sum(p -> get(fr.cpupct, p, 0.0), pids),
-        sum(p -> get(snap.cputime, p, 0.0), pids),
+        usage.threads,
+        usage.rss,
+        usage.cpu,
+        usage.time,
         start > 0 ? max(time() - start, 0.0) : -1.0,
         get(snap.state, pid, ' '),
         isjulia,
@@ -354,55 +368,114 @@ function _mkrow(fr::Frame, pid::Int, prefix::String, agg::Bool)
         cmd)
 end
 
+function _forest_order(snap::Snapshot, allpids::Set{Int})
+    roots = [pid for pid in allpids
+             if !haskey(snap.ppid, pid) || snap.ppid[pid] == pid ||
+                !(snap.ppid[pid] in allpids)]
+    order = Int[]
+    seen = Set{Int}()
+    function visit!(root)
+        stack = [root]
+        while !isempty(stack)
+            pid = pop!(stack)
+            pid in seen && continue
+            push!(seen, pid)
+            push!(order, pid)
+            for child in Iterators.reverse(get(snap.children, pid, Int[]))
+                child in allpids && !(child in seen) && push!(stack, child)
+            end
+        end
+    end
+    for root in roots
+        visit!(root)
+    end
+    # A malformed or racing snapshot can contain a parent cycle with no natural root.
+    # Include each remaining component once instead of dropping it or recursing forever.
+    for pid in allpids
+        if !(pid in seen)
+            push!(roots, pid)
+            visit!(pid)
+        end
+    end
+    return roots, order
+end
+
+function _subtree_usage(fr::Frame, order::Vector{Int})
+    snap = fr.snap
+    totals = Dict{Int,_Usage}()
+    for pid in Iterators.reverse(order)
+        total = _own_usage(fr, pid)
+        for child in get(snap.children, pid, Int[])
+            child == pid && continue
+            childtotal = get(totals, child, nothing)
+            childtotal === nothing && continue
+            total = _Usage(
+                total.threads + childtotal.threads,
+                total.rss + childtotal.rss,
+                total.cpu + childtotal.cpu,
+                total.time + childtotal.time,
+            )
+        end
+        totals[pid] = total
+    end
+    return totals
+end
+
 function _rows(st::TopState, fr::Frame)
     snap = fr.snap
-    allpids = union(keys(snap.cputime), keys(snap.ppid))
+    allpids = Set{Int}(union(keys(snap.cputime), keys(snap.ppid)))
     if !st.tree
-        rows = Row[_mkrow(fr, pid, "", false) for pid in allpids if _match(st, snap, pid)]
+        rows = Row[_mkrow(fr, pid, "") for pid in allpids if _match(st, snap, pid)]
         by = st.sortkey === :name ? (r -> lowercase(r.name)) : (r -> _sortval(st, r))
         sort!(rows; by, rev = st.rev && st.sortkey !== :name)
         return rows
     end
-    # Tree mode: DFS from the roots, sorting siblings by the sort key. A filtered-out
-    # process is still shown if a descendant matches, so trees stay connected.
-    rows = Row[]
+
+    roots, order = _forest_order(snap, allpids)
+    totals = _subtree_usage(fr, order)
+
+    # Compute filter retention in postorder. A filtered-out process remains visible when
+    # a descendant matches, so tree relationships stay understandable.
     keep = Dict{Int,Bool}()
-    function matches_below(pid)::Bool
-        get!(keep, pid) do
-            _match(st, snap, pid) || any(matches_below, get(snap.children, pid, Int[]))
-        end
+    for pid in Iterators.reverse(order)
+        keep[pid] = _match(st, snap, pid) ||
+                    any(child -> get(keep, child, false), get(snap.children, pid, Int[]))
     end
+
     # Order roots and siblings by their whole subtree's totals (independent of the Σ
-    # display toggle), so "sort by CPU" surfaces the busiest tree even when its root is
-    # an idle shell. Precompute the keys: `sort!(by=...)` re-evaluates per comparison.
+    # display toggle), so "sort by CPU" surfaces the busiest tree even when its root is an
+    # idle shell. Cache the rows used as sort keys: `sort!(by=...)` calls `by` repeatedly.
     treekey = if st.sortkey === :name
         pid -> lowercase(get(snap.name, pid, ""))
     else
-        subkey = Dict{Int,Float64}()
-        pid -> get!(() -> _sortval(st, _mkrow(fr, pid, "", true)), subkey, pid)
+        sortrows = Dict{Int,Row}()
+        pid -> _sortval(st,
+            get!(() -> _mkrow(fr, pid, "", totals[pid]), sortrows, pid))
     end
-    roots = [pid for pid in allpids
-             if !haskey(snap.ppid, pid) || snap.ppid[pid] == pid ||
-                !(snap.ppid[pid] in allpids)]
+    filter!(pid -> get(keep, pid, false), roots)
     sort!(roots; by = treekey, rev = st.rev)
+
+    # Iterative DFS avoids stack overflow for deep process trees.
+    rows = Row[]
     seen = Set{Int}()
-    # `stem` accumulates one glyph pair per ancestor: "│ " below an ancestor with later
-    # siblings, "  " below a last child — so vertical lines run continuously.
-    function walk(pid, stem, lastchild, isroot)
-        pid in seen && return
+    stack = Tuple{Int,String,Bool,Bool}[]
+    for i in Iterators.reverse(eachindex(roots))
+        push!(stack, (roots[i], "", false, true))
+    end
+    while !isempty(stack)
+        pid, stem, lastchild, isroot = pop!(stack)
+        pid in seen && continue
         push!(seen, pid)
-        matches_below(pid) || return
+        get(keep, pid, false) || continue
         push!(rows, _mkrow(fr, pid, isroot ? "" : stem * (lastchild ? "└─" : "├─"),
-            st.aggregate))
-        kids = [k for k in get(snap.children, pid, Int[]) if matches_below(k)]
+            st.aggregate ? totals[pid] : nothing))
+        kids = [k for k in get(snap.children, pid, Int[])
+                if k in allpids && get(keep, k, false) && !(k in seen)]
         sort!(kids; by = treekey, rev = st.rev)
         childstem = isroot ? "" : stem * (lastchild ? "  " : "│ ")
-        for (i, k) in enumerate(kids)
-            walk(k, childstem, i == length(kids), false)
+        for i in Iterators.reverse(eachindex(kids))
+            push!(stack, (kids[i], childstem, i == length(kids), false))
         end
-    end
-    for r in roots
-        walk(r, "", false, true)
     end
     return rows
 end
@@ -726,7 +799,8 @@ end
 
 An interactive, `htop`-like view of the system's processes, built on the same snapshot
 machinery as the rest of the package. Requires an interactive terminal; `top(io)` renders
-a single non-interactive frame to any `IO` instead.
+a single non-interactive frame to any `IO` instead. `interval` must be finite and greater
+than zero.
 
 The header shows system CPU (user green / sys red) and memory with braille history
 graphs, one mini-bar per core, load averages, uptime, process/thread totals, and a rollup
@@ -737,6 +811,7 @@ labeled with version (from the install path), role (`worker`, `precompile`) and
 function top(; interval::Real = 2.0, tree::Bool = false)
     Sys.iswindows() && error("ProcessMonitor: Windows is not yet supported")
     stdout isa Base.TTY || error("top() needs an interactive terminal; use top(io) for one frame")
+    interval = _validated_interval(interval)
     st = TopState(; interval, tree)
     term = REPL.Terminals.TTYTerminal(get(ENV, "TERM", ""), stdin, stdout, stderr)
     raw = reading = screen = false
@@ -756,16 +831,20 @@ function top(; interval::Real = 2.0, tree::Bool = false)
         prevcores = Sys.cpu_info()
         prevt = _monotime()
         fr = nothing
-        lastrefresh = 0.0
-        sleep(0.15)  # short priming sample: the first frame appears immediately with real data
+        lastrefresh_start = _monotime()
+        priming = true
         while st.running
-            if !st.paused && _monotime() - lastrefresh >= st.interval
+            now = _monotime()
+            refresh_after = priming ? 0.15 : st.interval
+            if !st.paused && now - lastrefresh_start >= refresh_after
+                refresh_start = now
                 snap = _snapshot(full = true)
                 cores = Sys.cpu_info()
                 t = _monotime()
                 fr = _frame(prev, snap, prevcores, cores, max(t - prevt, 0.001))
                 prev, prevcores, prevt = snap, cores, t
-                lastrefresh = t
+                lastrefresh_start = refresh_start
+                priming = false
                 _push_hist!(st, fr)
                 st.message = ""
                 _render(stdout, st, fr)
@@ -1051,18 +1130,25 @@ end
 
 Render one frame of the process view to `io` (sampling CPU over `interval` seconds) and
 return the number of process rows. Non-interactive; useful for logging and testing.
+`interval` must be finite and greater than zero.
 """
 function top(io::IO; interval::Real = 0.5, tree::Bool = false, color::Bool = false)
     Sys.iswindows() && error("ProcessMonitor: Windows is not yet supported")
+    interval = _validated_interval(interval)
     st = TopState(; interval, tree)
-    prev = _snapshot(full = true)
-    prevcores = Sys.cpu_info()
-    t0 = _monotime()
-    sleep(interval)
-    snap = _snapshot(full = true)
-    fr = _frame(prev, snap, prevcores, Sys.cpu_info(), max(_monotime() - t0, 0.001))
-    _push_hist!(st, fr)
-    return _render(io, st, fr; interactive = false, color)
+    timer = Timer(interval)
+    try
+        prev = _snapshot(full = true)
+        prevcores = Sys.cpu_info()
+        t0 = _monotime()
+        wait(timer)
+        snap = _snapshot(full = true)
+        fr = _frame(prev, snap, prevcores, Sys.cpu_info(), max(_monotime() - t0, 0.001))
+        _push_hist!(st, fr)
+        return _render(io, st, fr; interactive = false, color)
+    finally
+        close(timer)
+    end
 end
 
 # Compile the frame/render path into the package image so the first interactive frame

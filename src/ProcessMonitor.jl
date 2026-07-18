@@ -47,6 +47,13 @@ Snapshot() = Snapshot(Dict{Int,Float64}(), Dict{Int,Int}(), Dict{Int,Int}(),
 
 _monotime() = time_ns() / 1e9
 
+function _validated_interval(interval::Real)
+    value = Float64(interval)
+    isfinite(value) && value > 0 ||
+        throw(ArgumentError("interval must be finite and greater than zero"))
+    return value
+end
+
 # Linux and macOS expose stable process start times. BSD `ps` only exposes elapsed time
 # to one-second precision, so snapshots of the same process can differ slightly.
 _same_start(a::Real, b::Real) =
@@ -401,10 +408,15 @@ function cpu_percent(s::CPUSampler)
     total = 0.0
     for p in _tree(snap, s.pid, s.recursive)
         haskey(snap.cputime, p) || continue
-        # A new descendant, or a reused descendant PID, has no valid baseline yet.
-        previous = haskey(s.prev, p) &&
-                   _same_start(get(s.prev_start, p, -1.0), get(snap.start, p, -1.0)) ?
-                   s.prev[p] : snap.cputime[p]
+        # A genuinely new descendant's cumulative CPU time all falls within this sample
+        # interval. A PID present in both snapshots must also have the same identity.
+        previous = if !haskey(s.prev, p)
+            0.0
+        elseif _same_start(get(s.prev_start, p, -1.0), get(snap.start, p, -1.0))
+            s.prev[p]
+        else
+            snap.cputime[p]
+        end
         d = snap.cputime[p] - previous
         d > 0 && (total += d)
     end
@@ -418,9 +430,11 @@ end
     cpu_percent(pid::Integer = getpid(); recursive::Bool = false, interval::Real = 0.5) -> Float64
     cpu_percent(p::Base.Process; recursive::Bool = false, interval::Real = 0.5) -> Float64
 
-Blocking convenience: sample process `pid`, sleep `interval` seconds, sample again, and
-return the CPU utilization over that interval. See [`CPUSampler`](@ref) for the non-blocking
-form and for the meaning of `recursive`.
+Blocking convenience: start an interval timer, sample process `pid`, wait for the timer,
+sample again, and return the CPU utilization over that interval. Starting the timer before
+the baseline snapshot keeps snapshot collection from extending the requested period. See
+[`CPUSampler`](@ref) for the non-blocking form and for the meaning of `recursive`.
+`interval` must be finite and greater than zero.
 
 Note: on the BSDs `ps` reports CPU time with one-second resolution, so very short intervals
 quantize the result there; prefer an `interval` of at least a couple of seconds, or use a
@@ -428,9 +442,15 @@ quantize the result there; prefer an `interval` of at least a couple of seconds,
 finer resolution.
 """
 function cpu_percent(pid::Integer = getpid(); recursive::Bool = false, interval::Real = 0.5)
-    s = CPUSampler(pid; recursive)
-    sleep(interval)
-    return cpu_percent(s)
+    interval = _validated_interval(interval)
+    timer = Timer(interval)
+    try
+        s = CPUSampler(pid; recursive)
+        wait(timer)
+        return cpu_percent(s)
+    finally
+        close(timer)
+    end
 end
 cpu_percent(p::Base.Process; recursive::Bool = false, interval::Real = 0.5) =
     cpu_percent(getpid(p); recursive, interval)
