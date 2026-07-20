@@ -1,7 +1,7 @@
 name = "ProcessMonitor"
 uuid = "4131f68c-4ce9-42e2-8e2e-eec1ce550ab1"
 authors = ["Ian Butterworth <i.r.butterworth@gmail.com>"]
-version = "0.1.0"
+version = "0.1.1"
 
 [deps]
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
