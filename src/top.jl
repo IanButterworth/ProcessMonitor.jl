@@ -29,6 +29,8 @@ Base.@kwdef mutable struct TopState
     pendsig::Int = 0
     pendstart::Float64 = -1.0
     escpending::Float64 = 0.0 # monotonic time when an incomplete escape sequence arrived
+    lastclickpid::Int = 0     # process row used to recognize a double click
+    lastclicktime::Float64 = 0.0
     interval::Float64 = 2.0
     running::Bool = true
     cpuhist::Vector{Float64} = Float64[]
@@ -633,6 +635,112 @@ const _HELP = """
 
 # ---- rendering ----
 
+# Footer entries double as mouse hit targets. Keeping their labels and actions together
+# prevents the clickable regions from drifting away from what the user sees.
+function _footer_items(; graphs::Bool = false, interval::Float64 = 2.0)
+    slower = "+ slower ($(round(interval, digits = 1))s)"
+    if graphs
+        return [
+            (label = "q quit", key = 'q'),
+            (label = "g processes", key = 'g'),
+            (label = "? help", key = '?'),
+            (label = "␠ pause", key = ' '),
+            (label = "− faster", key = '-'),
+            (label = slower, key = '+'),
+        ]
+    end
+    return [
+        (label = "q quit", key = 'q'),
+        (label = "? help", key = '?'),
+        (label = "g graphs", key = 'g'),
+        (label = "/ filter", key = '/'),
+        (label = "T tree", key = 'T'),
+        (label = "a Σ", key = 'a'),
+        (label = "j julia", key = 'j'),
+        (label = "C cmd", key = 'C'),
+        (label = "↵ detail", key = '\r'),
+        (label = "k kill", key = 'k'),
+        (label = "P profile", key = 'P'),
+        (label = "− faster", key = '-'),
+        (label = slower, key = '+'),
+    ]
+end
+
+function _footer_targets(width::Int; graphs::Bool = false, interval::Float64 = 2.0)
+    targets = NamedTuple{(:first, :last, :key),Tuple{Int,Int,Char}}[]
+    x = 2
+    for item in _footer_items(; graphs, interval)
+        x > width && break
+        last = min(x + textwidth(item.label) - 1, width)
+        push!(targets, (first = x, last, key = item.key))
+        x += textwidth(item.label) + 2
+    end
+    return targets
+end
+
+# Underline only the key token, rather than the whole footer, as a quiet indication that
+# the surrounding label is clickable.
+function _print_footer!(io::IO, width::Int; graphs::Bool = false,
+        color::Bool = true, interval::Float64 = 2.0)
+    x = 1
+    print(io, " ")
+    x += 1
+    for item in _footer_items(; graphs, interval)
+        x > width && break
+        available = width - x + 1
+        label = textwidth(item.label) <= available ?
+            item.label : _ellipsize(item.label, available)
+        splitat = findfirst(' ', label)
+        keyend = splitat === nothing ? lastindex(label) : prevind(label, splitat)
+        key = label[firstindex(label):keyend]
+        rest = splitat === nothing ? "" : label[splitat:end]
+        color && print(io, "\e[4m")
+        print(io, key)
+        color && print(io, "\e[24m")
+        print(io, rest)
+        used = textwidth(label)
+        x += used
+        x > width && break
+        gap = min(2, width - x + 1)
+        print(io, repeat(' ', gap))
+        x += gap
+    end
+    return
+end
+
+function _heading(label::AbstractString, width::Int;
+        left::Bool = false, color::Bool = true, clickable::Bool = true)
+    shown = textwidth(label) <= width ? String(label) :
+            rstrip(_ellipsize(label, width))
+    pad = max(width - textwidth(shown), 0)
+    before, after = left ? (0, pad) : (pad, 0)
+    return string(repeat(' ', before),
+        color && clickable ? "\e[4m" : "", shown,
+        color && clickable ? "\e[24m" : "", repeat(' ', after))
+end
+
+function _table_header_targets(width::Int)
+    width = max(width, 60)
+    showspark = width >= 100
+    showage = width >= 88
+    namew = width - 51 - (showspark ? 9 : 0) - (showage ? 7 : 0)
+    targets = NamedTuple{(:first, :last, :sortkey),Tuple{Int,Int,Symbol}}[]
+    x = 1
+    push!(targets, (first = x, last = x + 6, sortkey = :pid)); x += 8
+    x += 8 + 1  # USER and following space
+    x += 1 + 1  # state and following space
+    push!(targets, (first = x, last = x + namew - 1, sortkey = :name)); x += namew + 1
+    showspark && (x += 8 + 1)
+    push!(targets, (first = x, last = x + 4, sortkey = :threads)); x += 6
+    push!(targets, (first = x, last = x + 6, sortkey = :mem)); x += 8
+    if showage
+        push!(targets, (first = x, last = x + 5, sortkey = :age)); x += 7
+    end
+    push!(targets, (first = x, last = x + 7, sortkey = :time)); x += 9
+    push!(targets, (first = x, last = x + 6, sortkey = :cpu))
+    return targets
+end
+
 function _history_stats(values::Vector{Float64})
     isempty(values) && return (0.0, 0.0)
     return sum(values) / length(values), maximum(values)
@@ -754,9 +862,9 @@ function _render_graph_view(io::IO, st::TopState, fr::Frame;
     end
 
     if interactive
-        footer = string(" g processes   ? help   space pause   +/− interval   q quit",
-            "   ·   ", round(st.interval, digits = 1), "s cadence")
-        print(buf, c("\e[2m"), _ellipsize(footer, width), c("\e[0m"), "\e[K")
+        print(buf, c("\e[2m"))
+        _print_footer!(buf, width; graphs = true, color, interval = st.interval)
+        print(buf, c("\e[0m"), "\e[K")
     else
         print(buf, c("\e[2m"), _ellipsize(" newest samples →", width), c("\e[0m"), eol)
     end
@@ -798,9 +906,11 @@ function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, colo
     print(buf, eol)
 
     barw = max(min(width ÷ 5, 24), 10)
-    print(buf, " CPU ", c("▕"), _bar2(fr.fuser, fr.fsys, barw; color), c("▏"),
+    print(buf, " ", _heading("CPU", 3; left = true, color), " ", c("▕"),
+        _bar2(fr.fuser, fr.fsys, barw; color), c("▏"),
         @sprintf("%5.1f%%", 100syscpu),
-        "   MEM ", c("▕"), _bar(memfrac, barw; color), c("▏"),
+        "   ", _heading("MEM", 3; left = true, color), " ", c("▕"),
+        _bar(memfrac, barw; color), c("▏"),
         @sprintf("%5.1f%%  ", 100memfrac),
         _fmtbytes(fr.memused), "/", _fmtbytes(fr.memtotal), eol)
     graphw = max((width - 7) ÷ 2 - 1, 10)
@@ -826,18 +936,18 @@ function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, colo
     showage = width >= 88
     namew = width - 51 - (showspark ? 9 : 0) - (showage ? 7 : 0)
     agg = st.tree && st.aggregate ? "Σ" : ""
-    sortmark(k) = st.sortkey === k ? "▾" : " "
+    sortmark(k) = st.sortkey === k ? "▾" : ""
     print(buf, c("\e[7m"),
-        lpad("PID", 7), " ",
+        _heading("PID" * sortmark(:pid), 7; color), " ",
         rpad("USER", 8), " ",
         "S", " ",
-        _ellipsize("NAME" * sortmark(:name), namew), " ",
+        _heading("NAME" * sortmark(:name), namew; left = true, color), " ",
         showspark ? rpad("HIST", 8) * " " : "",
-        lpad("THR" * sortmark(:threads), 5), " ",
-        lpad(agg * "RSS" * sortmark(:mem), 7), " ",
-        showage ? lpad("AGE" * sortmark(:age), 6) * " " : "",
-        lpad("TIME" * sortmark(:time), 8), " ",
-        lpad(agg * "CPU%" * sortmark(:cpu), 7),
+        _heading("THR" * sortmark(:threads), 5; color), " ",
+        _heading(agg * "RSS" * sortmark(:mem), 7; color), " ",
+        showage ? _heading("AGE" * sortmark(:age), 6; color) * " " : "",
+        _heading("TIME" * sortmark(:time), 8; color), " ",
+        _heading(agg * "CPU%" * sortmark(:cpu), 7; color),
         c("\e[0m"), eol)
 
     rows = _rows(st, fr)
@@ -926,10 +1036,9 @@ function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, colo
         elseif !isempty(st.message)
             print(buf, c("\e[33m"), " ", st.message, c("\e[0m"), "\e[K")
         else
-            print(buf, c("\e[2m"),
-                " q quit  ? help  g graphs  c/m/t/p/n/s sort  T tree  a Σ  j julia  C cmd  ",
-                "enter detail  k/K kill  P profile  (", round(st.interval, digits = 1), "s)",
-                c("\e[0m"), "\e[K")
+            print(buf, c("\e[2m"))
+            _print_footer!(buf, width; color, interval = st.interval)
+            print(buf, c("\e[0m"), "\e[K")
         end
     end
     write(io, take!(buf))
@@ -951,7 +1060,8 @@ graphs, one mini-bar per core, load averages, uptime, process/thread totals, and
 of all Julia processes (count, CPU, memory, threads). Julia rows are highlighted and
 labeled with version (from the install path), role (`worker`, `precompile`) and
 `--project`. Press `g` for the expanded CPU/memory signal view and `?` for the key
-reference.
+reference. In a mouse-capable terminal, click the underlined headings and footer controls;
+click a process to select it and double-click it for details.
 """
 function top(; interval::Real = 2.0, tree::Bool = false, graphs::Bool = false)
     Sys.iswindows() && error("ProcessMonitor: Windows is not yet supported")
@@ -970,7 +1080,9 @@ function top(; interval::Real = 2.0, tree::Bool = false, graphs::Bool = false)
         Base.start_reading(stdin)
         queue = UInt8[]
         screen = true
-        print(stdout, "\e[?1049h\e[?25l\e[2J")  # alternate screen, hide cursor
+        # Alternate screen, hidden cursor, and button-event tracking with SGR coordinates.
+        # 1000 reports presses/releases without the noisy hover stream from 1003.
+        print(stdout, "\e[?1049h\e[?25l\e[?1000h\e[?1006h\e[2J")
         flush(stdout)
         prev = _snapshot(full = true)
         prevcores = Sys.cpu_info()
@@ -1013,7 +1125,8 @@ function top(; interval::Real = 2.0, tree::Bool = false, graphs::Bool = false)
         end
         if screen
             try
-                print(stdout, "\e[?25h\e[?1049l")  # restore cursor and screen
+                # Disable mouse reporting before returning control to the REPL.
+                print(stdout, "\e[?1006l\e[?1000l\e[?25h\e[?1049l")
                 flush(stdout)
             catch
             end
@@ -1075,6 +1188,112 @@ function _drop_last_grapheme(s::AbstractString)
     return join(graphemes)
 end
 
+_default_sort_reverse(key::Symbol) = !(key in (:pid, :name))
+
+function _set_sort!(st::TopState, key::Symbol; toggle::Bool = false)
+    if toggle && st.sortkey === key
+        st.rev = !st.rev
+    else
+        st.sortkey = key
+        st.rev = _default_sort_reverse(key)
+    end
+    return
+end
+
+function _footer_key_at(x::Int, width::Int;
+        graphs::Bool = false, interval::Float64 = 2.0)
+    targets = _footer_targets(width; graphs, interval)
+    target = findfirst(t -> t.first <= x <= t.last, targets)
+    return target === nothing ? nothing : targets[target].key
+end
+
+# Handle a press reported by xterm's SGR mouse protocol. Coordinates are 1-based terminal
+# cells. A single row click selects; a second click on the same live PID opens its detail
+# pane. Column headings and the underlined footer keys invoke their keyboard equivalents.
+function _handle_mouse!(st::TopState, button::Int, x::Int, y::Int, fr;
+        rows_avail::Int = displaysize(stdout)[1],
+        width::Int = displaysize(stdout)[2])
+    x > 0 && y > 0 || return
+    (button & 32) == 0 || return  # ignore pointer motion if a terminal sends it
+    (button & 64) == 0 || return  # wheel events are not clicks
+    (button & 3) == 0 || return   # left button only
+    height = max(rows_avail, 14)
+    width = max(width, 60)
+
+    if st.help
+        st.help = false
+        return
+    end
+    # While text entry or a signal confirmation owns the footer, do not let a stray click
+    # trigger an unrelated action underneath it.
+    (st.filtering || st.pendpid != 0) && return
+
+    if st.graphs
+        if y == height
+            key = _footer_key_at(x, width; graphs = true, interval = st.interval)
+            key === nothing || _handle_key!(st, key, fr)
+        end
+        return
+    end
+
+    # The compact CPU/MEM summary is itself a doorway into the signal view.
+    if 2 <= y <= 4
+        st.graphs = true
+        return
+    end
+
+    if y == 6
+        target = findfirst(t -> t.first <= x <= t.last, _table_header_targets(width))
+        if target !== nothing
+            _set_sort!(st, _table_header_targets(width)[target].sortkey; toggle = true)
+            st.lastclickpid = 0
+        end
+        return
+    end
+
+    if y == height && isempty(st.message)
+        key = _footer_key_at(x, width; interval = st.interval)
+        key === nothing || _handle_key!(st, key, fr)
+        return
+    end
+
+    fr === nothing && return
+    rows = _rows(st, fr)
+    _sync_selection!(st, rows)
+    detaillines = String[]
+    if st.detail && 1 <= st.sel <= length(rows)
+        detaillines = _detail_lines(fr, rows[st.sel], width, max(height ÷ 2, 6))
+    end
+    detailh = isempty(detaillines) ? 0 : length(detaillines) + 1
+    nbody = max(height - 7 - detailh, 1)
+    if 7 <= y <= 6 + nbody
+        index = st.scroll + y - 6
+        if 1 <= index <= length(rows)
+            pid = rows[index].pid
+            now = _monotime()
+            doubleclick = st.lastclickpid == pid &&
+                          0.0 <= now - st.lastclicktime <= 0.45
+            st.sel = index
+            st.selpid = pid
+            st.lastclickpid = pid
+            st.lastclicktime = now
+            doubleclick && (st.detail = !st.detail)
+        end
+        return
+    end
+
+    return
+end
+
+function _decode_sgr_mouse(params::AbstractString)
+    startswith(params, '<') || return nothing
+    fields = split(params[2:end], ';')
+    length(fields) == 3 || return nothing
+    values = tryparse.(Int, fields)
+    any(isnothing, values) && return nothing
+    return (something(values[1]), something(values[2]), something(values[3]))
+end
+
 # Consume complete buffered input sequences. Incomplete escape sequences remain in `queue`
 # because readavailable() may split one terminal keypress or UTF-8 character across reads.
 function _drain_keys!(st::TopState, queue::Vector{UInt8}, fr)
@@ -1107,8 +1326,19 @@ function _drain_keys!(st::TopState, queue::Vector{UInt8}, fr)
                 changed = true
                 params = seq[3:end-1]
                 final = Char(seq[end])
-                ps = split(String(params), ';')
-                if st.help
+                # `String(::Vector{UInt8})` may take ownership of and empty its input, so
+                # materialize the parameter text once and share that immutable value.
+                paramtext = String(params)
+                ps = split(paramtext, ';')
+                mouse = (final == 'M' || final == 'm') ?
+                    _decode_sgr_mouse(paramtext) : nothing
+                if mouse !== nothing
+                    # SGR uses uppercase M for a button press and lowercase m for release.
+                    if final == 'M'
+                        button, x, y = mouse
+                        _handle_mouse!(st, button, x, y, fr)
+                    end
+                elseif st.help
                     st.help = false
                 elseif final == 'A'
                     _select_row!(st, st.sel - 1)
@@ -1222,17 +1452,17 @@ function _handle_key!(st::TopState, key::Char, fr)
     elseif (key == '\r' || key == '\n') && st.sel > 0
         st.detail = !st.detail
     elseif key == 'c'
-        st.sortkey = :cpu; st.rev = true
+        _set_sort!(st, :cpu)
     elseif key == 'm'
-        st.sortkey = :mem; st.rev = true
+        _set_sort!(st, :mem)
     elseif key == 't'
-        st.sortkey = :time; st.rev = true
+        _set_sort!(st, :time)
     elseif key == 's'
-        st.sortkey = :age; st.rev = true  # sorts by -age: newest first
+        _set_sort!(st, :age)  # sorts by -age: newest first
     elseif key == 'p'
-        st.sortkey = :pid; st.rev = false
+        _set_sort!(st, :pid)
     elseif key == 'n'
-        st.sortkey = :name; st.rev = false
+        _set_sort!(st, :name)
     elseif key == 'T'
         st.tree = !st.tree
         _select_row!(st, 0)

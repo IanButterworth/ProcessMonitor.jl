@@ -341,6 +341,16 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
                 @test length(sizelines) == height
                 @test all(line -> textwidth(line) <= width, sizelines)
             end
+
+            # Interactive controls use a restrained underline to advertise click targets.
+            mousebuf = IOBuffer()
+            mouseio = IOContext(mousebuf, :displaysize => (24, 80))
+            ProcessMonitor._render(mouseio, ProcessMonitor.TopState(), fr;
+                interactive=true, color=true)
+            mousetext = String(take!(mousebuf))
+            @test occursin("\e[4mCPU", mousetext)
+            @test occursin("\e[4mPID", mousetext)
+            @test occursin("\e[4mq", mousetext)
         end
 
         @testset "key decoding" begin
@@ -404,6 +414,65 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             ProcessMonitor._drain_keys!(utf, collect(codeunits("e\u0301")), nothing)
             ProcessMonitor._drain_keys!(utf, UInt8[0x7f], nothing)
             @test utf.filter == "é"  # backspace removes the last grapheme, not one codepoint
+
+            # iTerm2 and other modern terminals report clicks as SGR CSI sequences.
+            mouse = ProcessMonitor.TopState()
+            ProcessMonitor._drain_keys!(
+                mouse, collect(codeunits("\e[<0;2;6M")), nothing)
+            @test mouse.sortkey === :pid && !mouse.rev
+            # Button releases are consumed but do not activate the target a second time.
+            ProcessMonitor._drain_keys!(
+                mouse, collect(codeunits("\e[<0;2;6m")), nothing)
+            @test mouse.sortkey === :pid && !mouse.rev
+            # A mouse report can be split across reads just like an arrow sequence.
+            mouseq = collect(codeunits("\e[<0;2"))
+            @test !ProcessMonitor._drain_keys!(mouse, mouseq, nothing)
+            append!(mouseq, codeunits(";6M"))
+            @test ProcessMonitor._drain_keys!(mouse, mouseq, nothing)
+            @test mouse.sortkey === :pid && mouse.rev  # repeated header click reverses
+        end
+
+        @testset "mouse targets" begin
+            snap = ProcessMonitor.Snapshot()
+            for (pid, name) in ((11, "one"), (22, "two"))
+                snap.cputime[pid] = 1.0
+                snap.name[pid] = name
+            end
+            fr = ProcessMonitor.Frame(snap, Dict(11 => 20.0, 22 => 10.0),
+                Float64[], 0.0, 0.0, (0.0, 0.0, 0.0), 0.0, 1, 0, 2, 0)
+
+            st = ProcessMonitor.TopState()
+            ProcessMonitor._handle_mouse!(st, 0, 2, 7, fr;
+                rows_avail=24, width=80)
+            @test st.sel == 1 && st.selpid == 11 && !st.detail
+            ProcessMonitor._handle_mouse!(st, 0, 2, 7, fr;
+                rows_avail=24, width=80)
+            @test st.detail  # second click opens the selected process
+
+            # Table headings sort and repeated clicks reverse the chosen ordering.
+            ProcessMonitor._handle_mouse!(st, 0, 58, 6, fr;
+                rows_avail=24, width=80)
+            @test st.sortkey === :mem && st.rev
+            ProcessMonitor._handle_mouse!(st, 0, 58, 6, fr;
+                rows_avail=24, width=80)
+            @test st.sortkey === :mem && !st.rev
+
+            # CPU/MEM graphs and underlined footer controls are direct click targets.
+            ProcessMonitor._handle_mouse!(st, 0, 2, 2, fr;
+                rows_avail=24, width=80)
+            @test st.graphs
+            graph_g = only(filter(t -> t.key == 'g',
+                ProcessMonitor._footer_targets(80; graphs=true)))
+            ProcessMonitor._handle_mouse!(st, 0, graph_g.first, 24, fr;
+                rows_avail=24, width=80)
+            @test !st.graphs
+
+            # Right clicks and wheel reports do not activate left-click controls.
+            ProcessMonitor._handle_mouse!(st, 2, 2, 2, fr;
+                rows_avail=24, width=80)
+            ProcessMonitor._handle_mouse!(st, 64, 2, 2, fr;
+                rows_avail=24, width=80)
+            @test !st.graphs
         end
 
         @testset "tree name sorting" begin

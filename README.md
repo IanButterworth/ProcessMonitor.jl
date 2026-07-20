@@ -112,6 +112,11 @@ Keys (`?` shows this in-app): `g` expanded graphs · `c`/`m`/`t`/`p`/`n`/`s` sor
 `enter` detail · `k`/`K` SIGTERM/SIGKILL (with confirmation) · `P` profile · `+`/`-`
 interval · `space` pause · `q` quit.
 
+Mouse-capable terminals, including iTerm2, can click the subtly underlined controls:
+click a column heading to sort (again to reverse), the CPU/MEM summary to open expanded
+graphs, or a footer action to invoke it. Click a process row to select it and double-click
+to open its detail pane.
+
 The process table starts with no selected row. Press `↓` to enter it; pressing `↑` from
 the first row returns to the unselected position.
 
