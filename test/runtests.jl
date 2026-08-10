@@ -570,4 +570,6 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             @test_throws ArgumentError ProcessMonitor.info(deadpid)
         end
     end
+
+    include("juliac.jl")
 end
