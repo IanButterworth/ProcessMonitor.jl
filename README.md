@@ -147,6 +147,11 @@ against the libjulia of the Julia that built it by absolute path, so it runs as 
 that installation stays where it is. For a relocatable bundle, pass `--relative-rpath` to
 `juliac` and ship an adjacent `julia/` directory of shared libraries.
 
+The test suite builds and runs `jtop` (skipping where juliac or a C compiler is missing),
+so a dynamic dispatch introduced anywhere reachable from `top()` fails CI rather than
+quietly un-trimming the view. Set `PROCESSMONITOR_TEST_JULIAC=false` to skip that ~30s
+build locally.
+
 `--trim` only emits code it can prove is reachable and concretely typed, which is why the
 interactive view talks to the terminal through `termios`/`poll`/`read`/`write`/`ioctl`
 rather than through `stdin`/`stdout` and `REPL.Terminals`: Julia's standard streams are
