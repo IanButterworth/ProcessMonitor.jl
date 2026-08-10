@@ -165,9 +165,9 @@ function _snapshot_libproc(full::Bool = false)
     npids > 0 || return s
     pids = Vector{Cint}(undef, npids + 128)  # headroom for pids spawned since the count
     got = ccall(:proc_listallpids, Cint, (Ptr{Cint}, Cint), pids, sizeof(Cint) * length(pids))
-    rb = Ref(ntuple(_ -> UInt64(0), 16))  # rusage_info_v0: uuid[16B], ri_user_time, ri_system_time, ...
-    ti = Ref(ntuple(_ -> UInt64(0), 16))  # proc_taskinfo: virtual, resident, 4 more u64s, then int32s
-    bi = Ref(ntuple(_ -> UInt32(0), 40))  # proc_bsdinfo: pbi_pid, pbi_ppid, pbi_uid are the 4th-6th uint32s
+    rb = Ref(ntuple(_ -> UInt64(0), Val(16)))  # rusage_info_v0: uuid[16B], ri_user_time, ri_system_time, ...
+    ti = Ref(ntuple(_ -> UInt64(0), Val(16)))  # proc_taskinfo: virtual, resident, 4 more u64s, then int32s
+    bi = Ref(ntuple(_ -> UInt32(0), Val(40)))  # proc_bsdinfo: pbi_pid, pbi_ppid, pbi_uid are the 4th-6th uint32s
     nb = zeros(UInt8, 64)
     pb = zeros(UInt8, 4096)
     for i in 1:min(got, length(pids))

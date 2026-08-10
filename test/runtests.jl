@@ -520,10 +520,10 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             current.cputime[7] = 11.0
             previous.start[7] = 100.0
             current.start[7] = 100.0
-            same = ProcessMonitor._frame(previous, current, Any[], Any[], 2.0)
+            same = ProcessMonitor._frame(previous, current, Sys.CPUinfo[], Sys.CPUinfo[], 2.0)
             @test same.cpupct[7] ≈ 50.0
             current.start[7] = 110.0
-            reused = ProcessMonitor._frame(previous, current, Any[], Any[], 2.0)
+            reused = ProcessMonitor._frame(previous, current, Sys.CPUinfo[], Sys.CPUinfo[], 2.0)
             @test reused.cpupct[7] == 0.0
 
             sampler = CPUSampler()

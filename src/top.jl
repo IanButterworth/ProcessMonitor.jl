@@ -1,11 +1,95 @@
 # An htop-like interactive terminal view built on Snapshot differencing.
 
-import REPL
 using Printf: @sprintf
 using Unicode
 
 const SPARK = ('▁', '▂', '▃', '▄', '▅', '▆', '▇', '█')
 const HIST_LEN = 480
+
+# ---- terminal I/O ----
+#
+# The interactive view drives the terminal through file descriptors (termios, poll, read,
+# write, ioctl) rather than through `stdin`/`stdout` and `REPL.Terminals`. Base's standard
+# streams are reached through untyped globals and libuv's task-based event loop, neither of
+# which survives `juliac --trim`; these syscalls are statically resolvable, so one code path
+# serves both a normal session and a trimmed executable. Blocking in `poll` also means the
+# view idles without waking up, which matters for a process monitor.
+
+const _FD_IN = Cint(0)
+const _FD_OUT = Cint(1)
+
+_isatty(fd::Cint) = ccall(:isatty, Cint, (Cint,), fd) == 1
+
+# struct winsize { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; }
+const _TIOCGWINSZ = Culong(Sys.islinux() ? 0x5413 : 0x40087468)
+
+function _termsize()
+    ws = Ref((UInt16(0), UInt16(0), UInt16(0), UInt16(0)))
+    if ccall(:ioctl, Cint, (Cint, Culong, Ptr{Cvoid}...), _FD_OUT, _TIOCGWINSZ, ws) == 0
+        w = ws[]
+        w[1] > 0 && w[2] > 0 && return (Int(w[1]), Int(w[2]))
+    end
+    return (24, 80)  # a sane default when stdout is not a terminal
+end
+
+# `struct termios` is laid out differently on each platform, so treat it as an opaque blob:
+# read it, let libc's `cfmakeraw` edit it, and keep the original bytes to restore on exit.
+# `cfmakeraw` also clears OPOST, so interactive output ends its lines with CR+LF.
+const _TERMIOS_SIZE = 128  # comfortably larger than `struct termios` anywhere we run
+const _TCSAFLUSH = Cint(2)  # same value on Linux, macOS and the BSDs
+
+function _raw_mode_on()
+    saved = zeros(UInt8, _TERMIOS_SIZE)
+    ccall(:tcgetattr, Cint, (Cint, Ptr{UInt8}), _FD_IN, saved) == 0 || return nothing
+    raw = copy(saved)
+    ccall(:cfmakeraw, Cvoid, (Ptr{UInt8},), raw)
+    ccall(:tcsetattr, Cint, (Cint, Cint, Ptr{UInt8}), _FD_IN, _TCSAFLUSH, raw) == 0 ||
+        return nothing
+    return saved
+end
+
+_raw_mode_off(saved::Vector{UInt8}) =
+    ccall(:tcsetattr, Cint, (Cint, Cint, Ptr{UInt8}), _FD_IN, _TCSAFLUSH, saved) == 0
+
+# struct pollfd { int fd; short events; short revents; }
+const _POLLIN = Cshort(0x0001)
+const _NFDS_T = Sys.islinux() ? Culong : Cuint
+
+# Block until stdin has bytes to read or `timeout_ms` elapses; true if input is waiting.
+function _wait_readable(timeout_ms::Int)
+    pfd = Ref((_FD_IN, _POLLIN, Cshort(0)))
+    return ccall(:poll, Cint, (Ptr{Cvoid}, _NFDS_T, Cint), pfd, 1, Cint(timeout_ms)) > 0
+end
+
+const _EINTR = Cint(4)
+
+# Append whatever is readable from stdin to `queue`; returns the number of bytes added.
+function _read_stdin!(queue::Vector{UInt8}, buf::Vector{UInt8})
+    n = GC.@preserve buf ccall(:read, Cssize_t, (Cint, Ptr{UInt8}, Csize_t),
+        _FD_IN, pointer(buf), length(buf))
+    n > 0 || return 0
+    for i in 1:Int(n)
+        push!(queue, buf[i])
+    end
+    return Int(n)
+end
+
+function _write_out(ptr::Ptr{UInt8}, nbytes::Int)
+    off = 0
+    while off < nbytes
+        w = ccall(:write, Cssize_t, (Cint, Ptr{UInt8}, Csize_t),
+            _FD_OUT, ptr + off, nbytes - off)
+        if w <= 0
+            (w < 0 && Libc.errno() == _EINTR) && continue
+            break
+        end
+        off += Int(w)
+    end
+    return off
+end
+
+_write_out(bytes::Vector{UInt8}) = GC.@preserve bytes _write_out(pointer(bytes), length(bytes))
+_write_out(s::String) = GC.@preserve s _write_out(pointer(s), sizeof(s))
 
 Base.@kwdef mutable struct TopState
     sortkey::Symbol = :cpu   # :cpu, :mem, :pid, :time, :threads, :name, :age
@@ -54,13 +138,16 @@ struct Frame
     nthreads::Int
 end
 
-# (user-ish, sys-ish, idle) tick totals for one core
-_cpu_uis(c) = (
-    getfield(c, Symbol("cpu_times!user")) + getfield(c, Symbol("cpu_times!nice")),
-    getfield(c, Symbol("cpu_times!sys")) + getfield(c, Symbol("cpu_times!irq")),
-    getfield(c, Symbol("cpu_times!idle")))
+# (user-ish, sys-ish, idle) tick totals for one core. The field names contain `!`, so they
+# need `var"..."`; spelling them out (rather than `getfield(c, Symbol(...))`) keeps the
+# result concretely typed.
+_cpu_uis(c::Sys.CPUinfo) = (
+    c.var"cpu_times!user" + c.var"cpu_times!nice",
+    c.var"cpu_times!sys" + c.var"cpu_times!irq",
+    c.var"cpu_times!idle")
 
-function _frame(prev::Snapshot, snap::Snapshot, prevcores, cores, dt::Float64)
+function _frame(prev::Snapshot, snap::Snapshot, prevcores::Vector{Sys.CPUinfo},
+        cores::Vector{Sys.CPUinfo}, dt::Float64)
     cpupct = Dict{Int,Float64}()
     for (pid, t) in snap.cputime
         # New and reused PIDs have no valid baseline, so report zero for their first frame.
@@ -120,6 +207,43 @@ function _mem_used(memtotal::Int)
 end
 
 # ---- formatting helpers ----
+#
+# `repeat`, `lpad` and `rpad` are the workhorses of a text UI, but Base reaches all three
+# through an `@invoke` on an abstract signature (and `lpad`/`rpad` can fall into a
+# `Vector{Char}` show path), which `--trim` cannot resolve. `_rep`, `_lpad` and `_rpad` do
+# the same work with statically known callees, and match Base's display-width semantics.
+#
+# TODO: recheck on newer Julia versions — as Base becomes more trim-friendly these (and
+# `_fmtclock`, which stands in for `Libc.strftime`) should go back to the Base functions.
+
+function _rep(c::Char, n::Int)
+    n <= 0 && return ""
+    u = bswap(reinterpret(UInt32, c))       # UTF-8 bytes, first byte in the low octet
+    w = 4 - (leading_zeros(u | 0xff) >> 3)  # encoded length, 1..4
+    out = Vector{UInt8}(undef, w * n)
+    k = 0
+    for _ in 1:n, j in 0:(w - 1)
+        out[k += 1] = (u >> (8j)) % UInt8
+    end
+    return String(out)
+end
+
+function _rep(s::AbstractString, n::Int)
+    n <= 0 && return ""
+    str = String(s)
+    n == 1 && return str
+    w = sizeof(str)
+    out = Vector{UInt8}(undef, w * n)
+    k = 0
+    for _ in 1:n, j in 1:w
+        out[k += 1] = codeunit(str, j)
+    end
+    return String(out)
+end
+
+_lpad(s::AbstractString, w::Int) = _rep(' ', w - textwidth(s)) * String(s)
+_lpad(x::Integer, w::Int) = _lpad(string(x), w)
+_rpad(s::AbstractString, w::Int) = String(s) * _rep(' ', w - textwidth(s))
 
 function _fmtbytes(b::Real)
     b < 0 && return "?"
@@ -146,6 +270,18 @@ function _fmtuptime(secs::Real)
     return d > 0 ? @sprintf("%dd %d:%02d", d, h, m) : @sprintf("%d:%02d", h, m)
 end
 
+const _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+# Local wall-clock time as `Libc.strftime("%b %d %H:%M:%S", t)` would render it. `strftime`
+# itself routes through `cconvert(Cwstring, …)`, whose error path shows a `Vector{Int32}`
+# and so cannot be statically compiled.
+function _fmtclock(t::Real)
+    tm = Libc.TmStruct(t)
+    month = _MONTHS[clamp(Int(tm.month) + 1, 1, 12)]
+    return @sprintf("%s %02d %02d:%02d:%02d", month, tm.mday, tm.hour, tm.min, tm.sec)
+end
+
 function _fmtage(secs::Real)
     secs < 0 && return "?"
     secs < 100 && return @sprintf("%ds", secs)
@@ -163,8 +299,8 @@ function _bar(frac::Float64, width::Int; color::Bool = true)
     full = floor(Int, cells)
     part = cells - full
     partial = part > 0.125 ? SPARK[clamp(round(Int, part * 8), 1, 8)] : ' '
-    body = repeat('█', full) * (full < width ? string(partial) : "") *
-           repeat(' ', max(width - full - (full < width ? 1 : 0), 0))
+    body = _rep('█', full) * (full < width ? string(partial) : "") *
+           _rep(' ', max(width - full - (full < width ? 1 : 0), 0))
     return color ? string(_pctcolor(frac), body, "\e[0m") : body
 end
 
@@ -173,13 +309,13 @@ function _bar2(fu::Float64, fs::Float64, width::Int; color::Bool = true)
     ucells = floor(Int, clamp(fu, 0, 1) * width)
     scells = floor(Int, clamp(fu + fs, 0, 1) * width) - ucells
     pad = max(width - ucells - scells, 0)
-    color || return repeat('█', ucells) * repeat('▓', scells) * repeat(' ', pad)
-    return string("\e[32m", repeat('█', ucells), "\e[31m", repeat('█', scells), "\e[0m",
-        repeat(' ', pad))
+    color || return _rep('█', ucells) * _rep('▓', scells) * _rep(' ', pad)
+    return string("\e[32m", _rep('█', ucells), "\e[31m", _rep('█', scells), "\e[0m",
+        _rep(' ', pad))
 end
 
 function _spark(vals::Vector{Float64}, width::Int; color::Bool = true)
-    isempty(vals) && return repeat(' ', width)
+    isempty(vals) && return _rep(' ', width)
     v = vals[max(end - width + 1, 1):end]
     io = IOBuffer()
     for x in v
@@ -188,7 +324,7 @@ function _spark(vals::Vector{Float64}, width::Int; color::Bool = true)
         print(io, SPARK[clamp(ceil(Int, f * 8), 1, 8)])
     end
     color && print(io, "\e[0m")
-    print(io, repeat(' ', width - length(v)))
+    print(io, _rep(' ', width - length(v)))
     return String(take!(io))
 end
 
@@ -205,7 +341,7 @@ function _braille(vals::Vector{Float64}, width::Int, rows::Int;
     pad = width - cld(length(v), 2)
     lines = [IOBuffer() for _ in 1:rows]
     for l in lines
-        print(l, repeat(' ', pad))
+        print(l, _rep(' ', pad))
     end
     total = 4 * rows
     filled(x) = clamp(round(Int, clamp(x, 0, 1) * total), 0, total)
@@ -236,7 +372,7 @@ function _username(uid::Int)
 end
 
 _pad_display(s::AbstractString, w::Int) =
-    String(s) * repeat(' ', max(w - textwidth(s), 0))
+    String(s) * _rep(' ', max(w - textwidth(s), 0))
 
 function _ellipsize(s::AbstractString, w::Int)
     w = max(w, 0)
@@ -338,6 +474,14 @@ _sortval(st::TopState, r::Row) =
     st.sortkey === :age ? -r.age :
     st.sortkey === :threads ? Float64(r.threads) : 0.0
 
+# One sort key type for every column. Sorting by name leaves the numeric half constant and
+# vice versa, so a single `Tuple{String,Float64}` orders any column — and a single concrete
+# `by` function keeps `sort!` free of dynamic dispatch.
+const _SortKey = Tuple{String,Float64}
+
+_sortkey(st::TopState, r::Row)::_SortKey =
+    st.sortkey === :name ? (lowercase(r.name), 0.0) : ("", _sortval(st, r))
+
 struct _Usage
     threads::Int
     rss::Int
@@ -432,8 +576,7 @@ function _rows(st::TopState, fr::Frame)
     allpids = Set{Int}(union(keys(snap.cputime), keys(snap.ppid)))
     if !st.tree
         rows = Row[_mkrow(fr, pid, "") for pid in allpids if _match(st, snap, pid)]
-        by = st.sortkey === :name ? (r -> lowercase(r.name)) : (r -> _sortval(st, r))
-        sort!(rows; by, rev = st.rev && st.sortkey !== :name)
+        sort!(rows; by = r -> _sortkey(st, r), rev = st.rev && st.sortkey !== :name)
         return rows
     end
 
@@ -451,13 +594,9 @@ function _rows(st::TopState, fr::Frame)
     # Order roots and siblings by their whole subtree's totals (independent of the Σ
     # display toggle), so "sort by CPU" surfaces the busiest tree even when its root is an
     # idle shell. Cache the rows used as sort keys: `sort!(by=...)` calls `by` repeatedly.
-    treekey = if st.sortkey === :name
-        pid -> lowercase(get(snap.name, pid, ""))
-    else
-        sortrows = Dict{Int,Row}()
-        pid -> _sortval(st,
-            get!(() -> _mkrow(fr, pid, "", totals[pid]), sortrows, pid))
-    end
+    sortrows = Dict{Int,Row}()
+    treekey(pid::Int)::_SortKey = _sortkey(st,
+        get!(() -> _mkrow(fr, pid, "", totals[pid]), sortrows, pid))
     filter!(pid -> get(keep, pid, false), roots)
     sort!(roots; by = treekey, rev = st.rev)
 
@@ -514,7 +653,7 @@ end
 
 function _fdcount(pid::Int)
     if Sys.isapple()
-        bi = Ref(ntuple(_ -> UInt32(0), 40))
+        bi = Ref(ntuple(_ -> UInt32(0), Val(40)))
         r = ccall(:proc_pidinfo, Cint, (Cint, Cint, UInt64, Ptr{Cvoid}, Cint), pid, 3, 0, bi, 160)
         return r > 0 ? Int(bi[][25]) : -1  # pbi_nfiles
     elseif Sys.islinux()
@@ -554,7 +693,7 @@ end
 # a long value stays fully readable across several rows.
 function _wrap(label::AbstractString, text::AbstractString, width::Int)
     width = max(width, 16)
-    indent = repeat(' ', min(textwidth(label), width - 8))
+    indent = _rep(' ', min(textwidth(label), width - 8))
     graphemes = collect(Unicode.graphemes(label * text))
     out = String[]
     i, firstline = 1, true
@@ -592,7 +731,7 @@ end
 function _detail_lines(fr::Frame, r::Row, width::Int, maxlines::Int)
     snap = fr.snap
     started = r.age >= 0 ?
-        string(Libc.strftime("%b %d %H:%M:%S", time() - r.age), " (", _fmtage(r.age), " ago)") : "?"
+        string(_fmtclock(time() - r.age), " (", _fmtage(r.age), " ago)") : "?"
     pp = get(snap.ppid, r.pid, 0)
     parent = pp > 0 ? string(pp, " ", get(snap.name, pp, "?")) : "?"
     fds = _fdcount(r.pid)
@@ -702,7 +841,7 @@ function _print_footer!(io::IO, width::Int; graphs::Bool = false,
         x += used
         x > width && break
         gap = min(2, width - x + 1)
-        print(io, repeat(' ', gap))
+        print(io, _rep(' ', gap))
         x += gap
     end
     return
@@ -714,9 +853,9 @@ function _heading(label::AbstractString, width::Int;
             rstrip(_ellipsize(label, width))
     pad = max(width - textwidth(shown), 0)
     before, after = left ? (0, pad) : (pad, 0)
-    return string(repeat(' ', before),
+    return string(_rep(' ', before),
         color && clickable ? "\e[4m" : "", shown,
-        color && clickable ? "\e[24m" : "", repeat(' ', after))
+        color && clickable ? "\e[24m" : "", _rep(' ', after))
 end
 
 function _table_header_targets(width::Int)
@@ -759,15 +898,13 @@ function _axis_label(row::Int, rows::Int)
     return "    "
 end
 
-function _render_graph_view(io::IO, st::TopState, fr::Frame;
-        interactive::Bool = true, color::Bool = true)
-    rows_avail, width = displaysize(io)
+function _render_graph_view!(buf::IOBuffer, st::TopState, fr::Frame, rows_avail::Int,
+        cols::Int; interactive::Bool = true, color::Bool = true)
     height = max(rows_avail, 14)
-    width = max(width, 60)
-    buf = IOBuffer()
+    width = max(cols, 60)
     c(s) = color ? s : ""
     interactive && print(buf, "\e[H")
-    eol = interactive ? "\e[K\n" : "\n"
+    eol = interactive ? "\e[K\r\n" : "\n"
 
     syscpu = isempty(fr.percore) ? 0.0 : sum(fr.percore) / length(fr.percore)
     memfrac = fr.memtotal > 0 ? fr.memused / fr.memtotal : 0.0
@@ -844,7 +981,7 @@ function _render_graph_view(io::IO, st::TopState, fr::Frame;
         for column in 1:corecols
             position = (row - 1) * corecols + column
             if position > length(coreindices)
-                print(buf, repeat(' ', cellwidth))
+                print(buf, _rep(' ', cellwidth))
                 continue
             end
             index = coreindices[position]
@@ -856,9 +993,9 @@ function _render_graph_view(io::IO, st::TopState, fr::Frame;
             trail = _braille(history, trailwidth, 1; color)[1]
             print(buf, label, " ", c(_pctcolor(usage)), percent, c("\e[0m"), " ", trail)
             visible = textwidth(label) + textwidth(percent) + trailwidth + 2
-            print(buf, repeat(' ', max(cellwidth - visible, 0)))
+            print(buf, _rep(' ', max(cellwidth - visible, 0)))
         end
-        print(buf, repeat(' ', width - cellwidth * corecols), eol)
+        print(buf, _rep(' ', width - cellwidth * corecols), eol)
     end
 
     if interactive
@@ -868,30 +1005,34 @@ function _render_graph_view(io::IO, st::TopState, fr::Frame;
     else
         print(buf, c("\e[2m"), _ellipsize(" newest samples →", width), c("\e[0m"), eol)
     end
-    write(io, take!(buf))
     return length(_rows(st, fr))
 end
 
-function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, color::Bool = true)
+# Draw one frame into `buf` for a terminal `rows_avail` × `cols`, returning the number of
+# process rows. The caller supplies the size and delivers the bytes, so the interactive
+# loop can write to a file descriptor while `top(io)` writes to any `IO`.
+function _render!(buf::IOBuffer, st::TopState, fr::Frame, rows_avail::Int, cols::Int;
+        interactive::Bool = true, color::Bool = true)
     st.graphs && !st.help &&
-        return _render_graph_view(io, st, fr; interactive, color)
-    rows_avail, width = displaysize(io)
+        return _render_graph_view!(buf, st, fr, rows_avail, cols; interactive, color)
     height = max(rows_avail, 14)
-    width = max(width, 60)
-    buf = IOBuffer()
+    width = max(cols, 60)
     c(s) = color ? s : ""
     interactive && print(buf, "\e[H")
-    eol = interactive ? "\e[K\n" : "\n"
+    eol = interactive ? "\e[K\r\n" : "\n"
 
     syscpu = isempty(fr.percore) ? 0.0 : sum(fr.percore) / length(fr.percore)
     memfrac = fr.memtotal > 0 ? fr.memused / fr.memtotal : 0.0
 
-    # header: title, bar line, 2 braille history rows, cores line
+    # header: title, bar line, 2 braille history rows, cores line.
+    # Base's `print(io, xs...)` stops unrolling its argument tuple after roughly ten
+    # entries and falls back to a dynamically dispatched loop, so the long lines below are
+    # split into several short calls rather than written as one.
     print(buf, c("\e[1m"), " ProcessMonitor", c("\e[0m"),
         "  ", gethostname(),
         "  up ", _fmtuptime(fr.uptime),
-        @sprintf("  load %.2f %.2f %.2f", fr.loadavg...),
-        "  ", length(fr.percore), " cores  ",
+        @sprintf("  load %.2f %.2f %.2f", fr.loadavg...))
+    print(buf, "  ", length(fr.percore), " cores  ",
         fr.nprocs, " procs  ", fr.nthreads, " thr",
         st.paused ? c("\e[33m") * "  ⏸ paused" * c("\e[0m") : "")
     # active mode badges, so toggles are visible at a glance
@@ -908,11 +1049,11 @@ function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, colo
     barw = max(min(width ÷ 5, 24), 10)
     print(buf, " ", _heading("CPU", 3; left = true, color), " ", c("▕"),
         _bar2(fr.fuser, fr.fsys, barw; color), c("▏"),
-        @sprintf("%5.1f%%", 100syscpu),
-        "   ", _heading("MEM", 3; left = true, color), " ", c("▕"),
+        @sprintf("%5.1f%%", 100syscpu))
+    print(buf, "   ", _heading("MEM", 3; left = true, color), " ", c("▕"),
         _bar(memfrac, barw; color), c("▏"),
-        @sprintf("%5.1f%%  ", 100memfrac),
-        _fmtbytes(fr.memused), "/", _fmtbytes(fr.memtotal), eol)
+        @sprintf("%5.1f%%  ", 100memfrac))
+    print(buf, _fmtbytes(fr.memused), "/", _fmtbytes(fr.memtotal), eol)
     graphw = max((width - 7) ÷ 2 - 1, 10)
     cpug = _braille(st.cpuhist, graphw, 2; color)
     memg = _braille(st.memhist, graphw, 2; color)
@@ -928,7 +1069,8 @@ function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, colo
         jrss = sum(p -> get(fr.snap.rss, p, 0), jpids)
         jthr = sum(p -> get(fr.snap.threads, p, 0), jpids)
         print(buf, "   ", c("\e[35m"), "julia: ", length(jpids), " procs  ",
-            @sprintf("%.0f%%", jcpu), "  ", _fmtbytes(jrss), "  ", jthr, " thr", c("\e[0m"))
+            @sprintf("%.0f%%", jcpu))
+        print(buf, "  ", _fmtbytes(jrss), "  ", jthr, " thr", c("\e[0m"))
     end
     print(buf, eol)
 
@@ -939,14 +1081,14 @@ function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, colo
     sortmark(k) = st.sortkey === k ? "▾" : ""
     print(buf, c("\e[7m"),
         _heading("PID" * sortmark(:pid), 7; color), " ",
-        rpad("USER", 8), " ",
+        _rpad("USER", 8), " ",
         "S", " ",
-        _heading("NAME" * sortmark(:name), namew; left = true, color), " ",
-        showspark ? rpad("HIST", 8) * " " : "",
+        _heading("NAME" * sortmark(:name), namew; left = true, color), " ")
+    print(buf, showspark ? _rpad("HIST", 8) * " " : "",
         _heading("THR" * sortmark(:threads), 5; color), " ",
         _heading(agg * "RSS" * sortmark(:mem), 7; color), " ",
-        showage ? _heading("AGE" * sortmark(:age), 6; color) * " " : "",
-        _heading("TIME" * sortmark(:time), 8; color), " ",
+        showage ? _heading("AGE" * sortmark(:age), 6; color) * " " : "")
+    print(buf, _heading("TIME" * sortmark(:time), 8; color), " ",
         _heading(agg * "CPU%" * sortmark(:cpu), 7; color),
         c("\e[0m"), eol)
 
@@ -995,22 +1137,24 @@ function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, colo
                 r.name
             end
             statecol = r.state == 'Z' ? "\e[31m" : r.state == 'D' ? "\e[33m" : "\e[2m"
-            print(buf, lpad(r.pid, 7), " ",
+            print(buf, _lpad(r.pid, 7), " ",
                 c(r.uid == Int(ccall(:getuid, Cuint, ())) ? "\e[36m" : "\e[2m"),
                 _ellipsize(r.uid < 0 ? "?" : _username(r.uid), 8), c("\e[0m"),
-                selected ? c("\e[7m") : "", " ",
-                c(selected ? "" : statecol), r.state, c(selected ? "" : "\e[0m"),
-                selected ? "" : "", " ",
+                selected ? c("\e[7m") : "", " ")
+            print(buf,
+                c(selected ? "" : statecol), r.state, c(selected ? "" : "\e[0m"), " ",
                 r.pid == self ? c("\e[1m") : r.isjulia ? c("\e[35m") : "",
-                _ellipsize(prefix * label, namew), c(selected ? "" : "\e[0m"), " ",
+                _ellipsize(prefix * label, namew), c(selected ? "" : "\e[0m"), " ")
+            print(buf,
                 showspark ? _spark(get(st.pidhist, r.pid, Float64[]), 8;
                     color = color && !selected) * " " : "",
-                lpad(r.threads == 0 ? "?" : string(r.threads), 5), " ",
-                lpad(_fmtbytes(r.rss), 7), " ",
-                showage ? lpad(_fmtage(r.age), 6) * " " : "",
-                lpad(_fmttime(r.time), 8), " ",
+                _lpad(r.threads == 0 ? "?" : string(r.threads), 5), " ",
+                _lpad(_fmtbytes(r.rss), 7), " ",
+                showage ? _lpad(_fmtage(r.age), 6) * " " : "")
+            print(buf,
+                _lpad(_fmttime(r.time), 8), " ",
                 c(selected ? "" : _pctcolor(cpufrac)),
-                lpad(@sprintf("%.1f", r.cpu), 7), c("\e[0m"), eol)
+                _lpad(@sprintf("%.1f", r.cpu), 7), c("\e[0m"), eol)
         end
         if interactive
             for _ in (length(rows) - st.scroll):(nbody - 1)
@@ -1021,7 +1165,7 @@ function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, colo
 
     if interactive
         if !isempty(detaillines)
-            print(buf, c("\e[2m"), repeat('─', width), c("\e[0m"), eol)
+            print(buf, c("\e[2m"), _rep('─', width), c("\e[0m"), eol)
             for l in detaillines
                 print(buf, c("\e[2m"), l, c("\e[0m"), eol)
             end
@@ -1041,8 +1185,18 @@ function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = true, colo
             print(buf, c("\e[0m"), "\e[K")
         end
     end
-    write(io, take!(buf))
     return length(rows)
+end
+
+# Render a frame sized to `io` and write it there. Used by the non-interactive `top(io)`;
+# the interactive loop calls `_render!` directly.
+function _render(io::IO, st::TopState, fr::Frame; interactive::Bool = false,
+        color::Bool = true)
+    rows_avail, cols = displaysize(io)
+    buf = IOBuffer()
+    n = _render!(buf, st, fr, rows_avail, cols; interactive, color)
+    write(io, take!(buf))
+    return n
 end
 
 # ---- interactive loop ----
@@ -1065,25 +1219,20 @@ click a process to select it and double-click it for details.
 """
 function top(; interval::Real = 2.0, tree::Bool = false, graphs::Bool = false)
     Sys.iswindows() && error("ProcessMonitor: Windows is not yet supported")
-    stdout isa Base.TTY || error("top() needs an interactive terminal; use top(io) for one frame")
+    (_isatty(_FD_IN) && _isatty(_FD_OUT)) ||
+        error("top() needs an interactive terminal; use top(io) for one frame")
     interval = _validated_interval(interval)
     st = TopState(; interval, tree, graphs)
-    term = REPL.Terminals.TTYTerminal(get(ENV, "TERM", ""), stdin, stdout, stderr)
-    raw = reading = screen = false
+    saved = _raw_mode_on()
+    saved === nothing && error("top() could not put the terminal into raw mode")
+    screen = false
     try
-        raw = true
-        REPL.Terminals.raw!(term, true)
-        # Poll stdin on this task rather than blocking-read in a helper task: an orphaned
-        # blocked read would survive top() and swallow the first byte of every escape
-        # sequence the REPL receives afterwards.
-        reading = true
-        Base.start_reading(stdin)
-        queue = UInt8[]
         screen = true
         # Alternate screen, hidden cursor, and button-event tracking with SGR coordinates.
         # 1000 reports presses/releases without the noisy hover stream from 1003.
-        print(stdout, "\e[?1049h\e[?25l\e[?1000h\e[?1006h\e[2J")
-        flush(stdout)
+        _write_out("\e[?1049h\e[?25l\e[?1000h\e[?1006h\e[2J")
+        queue = UInt8[]
+        inbuf = Vector{UInt8}(undef, 4096)
         prev = _snapshot(full = true)
         prevcores = Sys.cpu_info()
         prevt = _monotime()
@@ -1104,41 +1253,36 @@ function top(; interval::Real = 2.0, tree::Bool = false, graphs::Bool = false)
                 priming = false
                 _push_hist!(st, fr)
                 st.message = ""
-                _render(stdout, st, fr)
+                _draw(st, fr)
             end
-            # wait for input or the next refresh tick
-            deadline = _monotime() + 0.05
-            while _monotime() < deadline && bytesavailable(stdin) == 0
-                sleep(0.01)
-            end
-            bytesavailable(stdin) > 0 && append!(queue, readavailable(stdin))
-            if _drain_keys!(st, queue, fr) && fr !== nothing
-                _render(stdout, st, fr)
+            # Sleep in `poll` until stdin has something to say or the next refresh is due.
+            # An incomplete escape sequence needs a prompt second look so a bare Escape is
+            # still recognized, and a paused view has no tick to wait for.
+            due = st.paused ? 1.0 : max(lastrefresh_start + refresh_after - _monotime(), 0.0)
+            st.escpending == 0.0 || (due = min(due, 0.05))
+            _wait_readable(clamp(round(Int, due * 1000), 0, 1000)) &&
+                _read_stdin!(queue, inbuf)
+            height, width = _termsize()
+            if _drain_keys!(st, queue, fr, height, width) && fr !== nothing
+                _draw(st, fr)
             end
         end
     finally
-        if reading
-            try
-                Base.stop_reading(stdin)
-            catch
-            end
-        end
         if screen
-            try
-                # Disable mouse reporting before returning control to the REPL.
-                print(stdout, "\e[?1006l\e[?1000l\e[?25h\e[?1049l")
-                flush(stdout)
-            catch
-            end
+            # Disable mouse reporting before returning control to the caller.
+            _write_out("\e[?1006l\e[?1000l\e[?25h\e[?1049l")
         end
-        if raw
-            try
-                REPL.Terminals.raw!(term, false)
-            catch
-            end
-        end
+        _raw_mode_off(saved)
     end
     return nothing
+end
+
+function _draw(st::TopState, fr::Frame)
+    height, width = _termsize()
+    buf = IOBuffer()
+    n = _render!(buf, st, fr, height, width; interactive = true, color = true)
+    _write_out(take!(buf))
+    return n
 end
 
 # Return true once an incomplete escape sequence has waited long enough to be interpreted
@@ -1162,6 +1306,14 @@ function _handle_bare_escape!(st::TopState)
     return
 end
 
+# Remove the first `n` bytes of `queue` and return them. (`splice!(queue, 1:n)` defaults its
+# replacement to a `Vector{Any}`, which drags a dynamic `convert` into the type-stable path.)
+function _takefirst!(queue::Vector{UInt8}, n::Int)
+    seq = queue[1:n]
+    deleteat!(queue, 1:n)
+    return seq
+end
+
 function _pop_utf8_char!(queue::Vector{UInt8})
     b = queue[1]
     nbytes = b <= 0x7f ? 1 :
@@ -1178,7 +1330,7 @@ function _pop_utf8_char!(queue::Vector{UInt8})
         popfirst!(queue)
         return true, nothing
     end
-    splice!(queue, 1:nbytes)
+    deleteat!(queue, 1:nbytes)
     return true, first(encoded)
 end
 
@@ -1210,9 +1362,8 @@ end
 # Handle a press reported by xterm's SGR mouse protocol. Coordinates are 1-based terminal
 # cells. A single row click selects; a second click on the same live PID opens its detail
 # pane. Column headings and the underlined footer keys invoke their keyboard equivalents.
-function _handle_mouse!(st::TopState, button::Int, x::Int, y::Int, fr;
-        rows_avail::Int = displaysize(stdout)[1],
-        width::Int = displaysize(stdout)[2])
+function _handle_mouse!(st::TopState, button::Int, x::Int, y::Int, fr::Union{Nothing,Frame};
+        rows_avail::Int = _termsize()[1], width::Int = _termsize()[2])
     x > 0 && y > 0 || return
     (button & 32) == 0 || return  # ignore pointer motion if a terminal sends it
     (button & 64) == 0 || return  # wheel events are not clicks
@@ -1296,7 +1447,8 @@ end
 
 # Consume complete buffered input sequences. Incomplete escape sequences remain in `queue`
 # because readavailable() may split one terminal keypress or UTF-8 character across reads.
-function _drain_keys!(st::TopState, queue::Vector{UInt8}, fr)
+function _drain_keys!(st::TopState, queue::Vector{UInt8}, fr::Union{Nothing,Frame},
+        rows_avail::Int = _termsize()[1], width::Int = _termsize()[2])
     changed = false
     while !isempty(queue) && st.running
         if queue[1] == 0x1b
@@ -1321,7 +1473,7 @@ function _drain_keys!(st::TopState, queue::Vector{UInt8}, fr)
                     _handle_bare_escape!(st)
                     continue
                 end
-                seq = splice!(queue, 1:finalindex)
+                seq = _takefirst!(queue, finalindex)
                 st.escpending = 0.0
                 changed = true
                 params = seq[3:end-1]
@@ -1336,7 +1488,7 @@ function _drain_keys!(st::TopState, queue::Vector{UInt8}, fr)
                     # SGR uses uppercase M for a button press and lowercase m for release.
                     if final == 'M'
                         button, x, y = mouse
-                        _handle_mouse!(st, button, x, y, fr)
+                        _handle_mouse!(st, button, x, y, fr; rows_avail, width)
                     end
                 elseif st.help
                     st.help = false
@@ -1365,7 +1517,7 @@ function _drain_keys!(st::TopState, queue::Vector{UInt8}, fr)
                     _handle_bare_escape!(st)
                     continue
                 end
-                seq = splice!(queue, 1:3)
+                seq = _takefirst!(queue, 3)
                 st.escpending = 0.0
                 changed = true
                 k2 = Char(seq[3])
@@ -1413,7 +1565,7 @@ function _push_hist!(st::TopState, fr::Frame)
     return
 end
 
-function _handle_key!(st::TopState, key::Char, fr)
+function _handle_key!(st::TopState, key::Char, fr::Union{Nothing,Frame})
     if st.help
         st.help = false
         return
