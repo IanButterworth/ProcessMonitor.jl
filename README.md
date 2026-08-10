@@ -123,6 +123,37 @@ the first row returns to the unselected position.
 `top(io)` renders a single non-interactive frame to any `IO` (for logging or CI
 diagnostics); use `tree=true` for the tree form or `graphs=true` for the signal view.
 
+## `jtop`: a standalone executable
+
+The view compiles to a small self-contained binary with `juliac --trim`, which starts
+instantly and needs no Julia session:
+
+```sh
+julia --project=. juliac/build.jl     # writes ./jtop (~2.5 MiB)
+./jtop                                # or: ./jtop --tree --interval 1
+```
+
+```text
+Usage: jtop [options]
+  -i, --interval SECS   refresh interval (default 2.0)
+  -t, --tree            start in tree view
+  -g, --graphs          start in the expanded CPU/memory signal view
+  -h, --help            show this message
+```
+
+Requires Julia 1.12 or newer (that is when `juliac` ships in `share/julia/juliac`) and a C
+compiler for the final link. The binary is not committed to the repository; it links
+against the libjulia of the Julia that built it by absolute path, so it runs as long as
+that installation stays where it is. For a relocatable bundle, pass `--relative-rpath` to
+`juliac` and ship an adjacent `julia/` directory of shared libraries.
+
+`--trim` only emits code it can prove is reachable and concretely typed, which is why the
+interactive view talks to the terminal through `termios`/`poll`/`read`/`write`/`ioctl`
+rather than through `stdin`/`stdout` and `REPL.Terminals`: Julia's standard streams are
+reached through untyped globals and libuv's task scheduler, neither of which survives
+trimming. Blocking in `poll` instead of polling `stdin` also means the view idles without
+waking up — which matters for something whose job is to watch CPU use.
+
 ## Notes
 
 - `recursive=true` walks the process tree at call time, so it covers subprocesses that are
