@@ -403,9 +403,9 @@ _isjulia(snap::Snapshot, pid::Integer) =
 function _julia_version_from_path(exe::AbstractString)
     isempty(exe) && return ""
     m = match(r"julia-(\d+\.\d+\.\d+)", exe)
-    m === nothing || return m[1]
+    m === nothing || return String(m[1])
     m = match(r"[Jj]ulia-(\d+\.\d+)", exe)
-    m === nothing || return m[1]
+    m === nothing || return String(m[1])
     occursin(r"usr/bin/julia$", exe) && return "dev"
     return ""
 end
@@ -422,13 +422,201 @@ function _julia_role(cmd::AbstractString)
     return ""
 end
 
-# The active project from --project, shortened to its basename.
-function _julia_project(cmd::AbstractString)
+# The --project flag value as written: "@." for a bare `--project`, `nothing` when absent.
+function _project_flag(cmd::AbstractString)
     m = match(r"--project(?:=(\S+))?", cmd)
-    m === nothing && return ""
+    m === nothing && return nothing
     v = m[1]
-    (v === nothing || v == "@.") && return "@."
+    return v === nothing ? "@." : String(v)
+end
+
+# The active project from --project alone, shortened to its basename. This is the label of
+# last resort, for processes whose cwd and environment we cannot read (other users').
+function _julia_project(cmd::AbstractString)
+    v = _project_flag(cmd)
+    v === nothing && return ""
+    v == "@." && return "@."
     return basename(rstrip(v, ('/', '\\')))
+end
+
+# ---- active project resolution ----
+#
+# Julia settles its active project at startup and nothing outside the process records the
+# result, so replay Base's rules (init_active_project / active_project) from what the
+# process table does expose: its command line, environment and working directory.
+#   1. `--project[=X]` on the command line, else JULIA_PROJECT (empty counts as unset);
+#   2. failing that, the first usable JULIA_LOAD_PATH entry (default "@", "@v#.#", "@stdlib").
+# "@." walks up from the cwd looking for a project file (stopping at $HOME, as Julia does),
+# "@name" is a depot environment, and anything else is a path relative to the cwd. The
+# result is the project *directory*, or "" when it cannot be determined. A runtime
+# `Pkg.activate` is invisible from outside, so this is the startup project.
+#
+# Precompilation workers get their load path over stdin, not on the command line, so they
+# are resolved through their parent (see `_project_dir`).
+
+const _PROJECT_FILES = ("JuliaProject.toml", "Project.toml")
+
+_has_project_file(dir::String) = any(f -> isfile(joinpath(dir, f)), _PROJECT_FILES)
+
+# Base.current_project: the nearest ancestor of `dir` (inclusive) with a project file.
+function _walk_project(dir::String, home::String)
+    isempty(dir) && return nothing
+    while true
+        _has_project_file(dir) && return dir
+        dir == home && return nothing
+        parent = dirname(dir)
+        parent == dir && return nothing
+        dir = parent
+    end
+end
+
+# The depots a process would search, from its JULIA_DEPOT_PATH (an empty entry stands for
+# the default user depot, as in Base.init_depot_path) or the default alone.
+function _depots(env::Vector{String}, home::String)
+    default = isempty(home) ? "" : joinpath(home, ".julia")
+    str = _getenv(env, "JULIA_DEPOT_PATH")
+    str === nothing && return isempty(default) ? String[] : [default]
+    isempty(str) && return String[]
+    depots = String[]
+    for d in eachsplit(str, ':')
+        d = isempty(d) ? default : _expanduser(String(d), home)
+        isempty(d) || d in depots || push!(depots, d)
+    end
+    return depots
+end
+
+# Substitute VERSION into "@v#.#" using the version label we have for the executable;
+# `nothing` when that label is not a real version ("dev", "").
+function _named_env(name::String, ver::String)
+    if occursin('#', name)
+        parts = split(ver, '.')
+        for part in parts
+            tryparse(Int, part) === nothing && return nothing
+        end
+        for part in parts
+            name = replace(name, '#' => String(part); count = 1)
+        end
+        occursin('#', name) && return nothing
+    end
+    return name
+end
+
+# "" when the path cannot be expanded (no HOME known, or the unsupported ~user form).
+function _expanduser(path::String, home::String)
+    startswith(path, '~') || return path
+    isempty(home) && return ""
+    (length(path) == 1 || path[2] == '/') || return ""
+    return home * path[2:end]
+end
+
+# Absolute, normalized path; "" when `path` is relative and the cwd is unknown.
+function _abspath(path::String, cwd::String)
+    isempty(path) && return ""
+    isabspath(path) || (isempty(cwd) && return ""; path = joinpath(cwd, path))
+    path = normpath(path)  # keeps a trailing '/' for "dir/." and "dir/", so drop it
+    return length(path) > 1 ? String(rstrip(path, '/')) : path
+end
+
+# A project *file* path becomes its directory; anything else is taken to be the directory.
+_project_dir_of(path::String) = basename(path) in _PROJECT_FILES ? dirname(path) : path
+
+# Base.load_path_expand for one entry, reduced to a project directory; `nothing` when the
+# entry does not name a project. `strict` mirrors active_project's treatment of LOAD_PATH
+# entries: a plain path only counts if it actually holds a project file, whereas the
+# --project/JULIA_PROJECT value is accepted as written.
+function _expand_entry(entry::String, cwd::String, env::Vector{String}, ver::String,
+                       home::String, strict::Bool)
+    if startswith(entry, '@')
+        entry == "@." && return _walk_project(cwd, home)
+        (entry == "@" || entry == "@stdlib" || entry == "@temp" ||
+            startswith(entry, "@script")) && return nothing
+        name = _named_env(entry[2:end], ver)
+        name === nothing && return nothing
+        depots = _depots(env, home)
+        for depot in depots
+            dir = joinpath(depot, "environments", name)
+            isdir(dir) && return dir
+        end
+        isempty(depots) && return nothing
+        return joinpath(depots[1], "environments", name)
+    end
+    path = _abspath(_expanduser(entry, home), cwd)
+    isempty(path) && return nothing
+    dir = _project_dir_of(path)
+    strict && !_has_project_file(dir) && return nothing
+    return dir
+end
+
+function _resolve_project(cmd::String, cwd::String, env::Vector{String}, ver::String)
+    home = _getenv(env, "HOME")
+    home = home === nothing ? "" : home
+    project = _project_flag(cmd)
+    if project === nothing
+        project = _getenv(env, "JULIA_PROJECT")
+        project !== nothing && isempty(project) && (project = nothing)
+    end
+    if project !== nothing
+        dir = _expand_entry(project, cwd, env, ver, home, false)
+        dir === nothing || return dir
+    end
+    lp = _getenv(env, "JULIA_LOAD_PATH")
+    entries = lp === nothing ? ["@", "@v#.#", "@stdlib"] : String[]
+    if lp !== nothing
+        for e in eachsplit(lp, ':')
+            if isempty(e)
+                append!(entries, ("@", "@v#.#", "@stdlib"))
+            else
+                push!(entries, _expanduser(String(e), home))
+            end
+        end
+    end
+    for e in entries
+        e == "@" && continue
+        dir = _expand_entry(e, cwd, env, ver, home, true)
+        dir === nothing || return dir
+    end
+    return ""
+end
+
+# Short label for the table: "@v1.12" for depot environments, else the directory name.
+function _project_label(dir::String)
+    isempty(dir) && return ""
+    basename(dirname(dir)) == "environments" && return "@" * basename(dir)
+    return basename(dir)
+end
+
+# Resolved project directories by pid, valid while the pid's start time matches. Resolving
+# costs a few syscalls and directory probes per Julia process; the result is fixed for the
+# process's lifetime, so remember it. `_prune_projects!` drops exited pids each frame.
+const _PROJECTS = Dict{Int,Tuple{Float64,String}}()
+
+function _prune_projects!(snap::Snapshot)
+    filter!(kv -> haskey(snap.cputime, kv.first), _PROJECTS)
+    return
+end
+
+# The resolved project directory of Julia process `pid`, "" when unknown. A precompile
+# worker inherits its parent's load path over stdin (and its cwd and environment through
+# the usual fork), so it reports whatever its Julia parent resolves to; the same holds for
+# nested precompilation, hence the walk up the ancestry.
+function _project_dir(snap::Snapshot, pid::Int, depth::Int = 0)
+    start = get(snap.start, pid, -1.0)
+    cached = get(_PROJECTS, pid, (-2.0, ""))
+    cached[1] == start && start > 0 && return cached[2]
+    cmd = get(snap.cmd, pid, "")
+    dir = ""
+    if startswith(_julia_role(cmd), "precompile") && _project_flag(cmd) === nothing
+        ppid = get(snap.ppid, pid, 0)
+        if ppid > 0 && ppid != pid && _isjulia(snap, ppid) && depth < 8
+            dir = _project_dir(snap, ppid, depth + 1)
+        end
+    end
+    if isempty(dir)
+        ver = _julia_version_from_path(get(snap.exe, pid, ""))
+        dir = _resolve_project(cmd, _cwd(pid), _environ(pid), ver)
+    end
+    start > 0 && (_PROJECTS[pid] = (start, dir))
+    return dir
 end
 
 # ---- row assembly ----
@@ -447,7 +635,8 @@ struct Row
     isjulia::Bool
     ver::String         # Julia version label ("" when unknown / not Julia)
     role::String        # "worker"/"precompile"/"" for Julia processes
-    project::String     # active --project for Julia processes
+    project::String     # active project label for Julia processes ("" when unknown)
+    projectdir::String  # resolved project directory ("" when unknown)
     cmd::String         # full command line ("" when unavailable)
 end
 
@@ -502,6 +691,7 @@ function _mkrow(fr::Frame, pid::Int, prefix::String, usage::Union{Nothing,_Usage
     isjulia = _isjulia(snap, pid)
     cmd = get(snap.cmd, pid, "")
     start = get(snap.start, pid, -1.0)
+    projectdir = isjulia ? _project_dir(snap, pid) : ""
     return Row(pid, prefix,
         get(snap.name, pid, "?"),
         get(snap.uid, pid, -1),
@@ -514,7 +704,8 @@ function _mkrow(fr::Frame, pid::Int, prefix::String, usage::Union{Nothing,_Usage
         isjulia,
         isjulia ? _julia_version_from_path(get(snap.exe, pid, "")) : "",
         isjulia ? _julia_role(cmd) : "",
-        isjulia ? _julia_project(cmd) : "",
+        isempty(projectdir) ? (isjulia ? _julia_project(cmd) : "") : _project_label(projectdir),
+        projectdir,
         cmd)
 end
 
@@ -573,6 +764,7 @@ end
 
 function _rows(st::TopState, fr::Frame)
     snap = fr.snap
+    _prune_projects!(snap)
     allpids = Set{Int}(union(keys(snap.cputime), keys(snap.ppid)))
     if !st.tree
         rows = Row[_mkrow(fr, pid, "") for pid in allpids if _match(st, snap, pid)]
@@ -735,10 +927,11 @@ function _detail_lines(fr::Frame, r::Row, width::Int, maxlines::Int)
     pp = get(snap.ppid, r.pid, 0)
     parent = pp > 0 ? string(pp, " ", get(snap.name, pp, "?")) : "?"
     fds = _fdcount(r.pid)
-    cwd = Sys.islinux() ? (try readlink("/proc/$(r.pid)/cwd") catch; "" end) : ""
+    cwd = _cwd(r.pid)
+    project = isempty(r.projectdir) ? r.project : r.projectdir
     jl = r.isjulia ? string("  julia ", r.ver,
         isempty(r.role) ? "" : "  role $(r.role)",
-        isempty(r.project) ? "" : "  project $(r.project)") : ""
+        isempty(project) ? "" : "  project $project") : ""
     exe = get(snap.exe, r.pid, "")
     args = _strip_argv0(r.cmd)
     lines = String[]
@@ -1212,8 +1405,9 @@ than zero.
 The header shows system CPU (user green / sys red) and memory with braille history
 graphs, one mini-bar per core, load averages, uptime, process/thread totals, and a rollup
 of all Julia processes (count, CPU, memory, threads). Julia rows are highlighted and
-labeled with version (from the install path), role (`worker`, `precompile`) and
-`--project`. Press `g` for the expanded CPU/memory signal view and `?` for the key
+labeled with version (from the install path), role (`worker`, `precompile`) and active
+project (resolved from `--project`, `JULIA_PROJECT`, the load path and the working
+directory; precompile workers report their parent's). Press `g` for the expanded CPU/memory signal view and `?` for the key
 reference. In a mouse-capable terminal, click the underlined headings and footer controls;
 click a process to select it and double-click it for details.
 """

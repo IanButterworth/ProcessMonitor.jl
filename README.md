@@ -89,10 +89,15 @@ An `htop`-like view with some things `htop` doesn't have:
   really using the CPU" question flat per-process views can't answer.
 - **Julia-aware**: Julia processes are highlighted and labeled with their version (from
   the juliaup/app install path; in-tree builds show `dev`), role (`worker`,
-  `precompile`) and `--project`; a header rollup totals Julia's CPU, memory and threads
-  across the machine; `j` filters to Julia processes only; and `P` asks a Julia process
-  to print a one-shot profile to its stderr (`SIGUSR1`/`SIGINFO`). Handy for watching a
-  test suite, `Distributed` workers, or precompilation fan-out.
+  `precompile`) and active project. The project is resolved the way Julia does at
+  startup — `--project`, then `JULIA_PROJECT`, then the load path, with `@.` walked up
+  from the process's working directory and `@v1.12`-style depot environments named as
+  such — and precompile workers, which get their load path over stdin, report their
+  parent's. The detail pane shows the full project directory. A header rollup totals
+  Julia's CPU, memory and threads across the machine; `j` filters to Julia processes
+  only; and `P` asks a Julia process to print a one-shot profile to its stderr
+  (`SIGUSR1`/`SIGINFO`). Handy for watching a test suite, `Distributed` workers, or
+  precompilation fan-out.
 - **Braille history graphs** for system CPU and memory, per-process CPU sparklines on wide
   terminals, a per-core mini-bar row, and user/sys split CPU bars.
 - **Expanded signal view** (`g`): full-width, high-resolution Braille histories for total
