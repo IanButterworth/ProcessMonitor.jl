@@ -266,6 +266,116 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
             @test ProcessMonitor._julia_project("julia --project -e 1") == "@."
             @test ProcessMonitor._julia_project("julia -e 1") == ""
 
+            # the active project is replayed from cmdline, environment and cwd the way
+            # Julia resolves it at startup
+            mktempdir() do home
+                home = realpath(home)
+                foo = joinpath(home, "Foo")
+                mkpath(joinpath(foo, "src", "deep"))
+                touch(joinpath(foo, "Project.toml"))
+                bar = joinpath(home, "Bar")
+                mkpath(bar)
+                touch(joinpath(bar, "JuliaProject.toml"))
+                depot = joinpath(home, "depot")
+                v112 = joinpath(depot, "environments", "v1.12")
+                mkpath(v112)
+                touch(joinpath(v112, "Project.toml"))
+                mkpath(joinpath(home, "empty"))
+                env = ["HOME=$home", "JULIA_DEPOT_PATH=$depot"]
+                deep = joinpath(foo, "src", "deep")
+                resolve = ProcessMonitor._resolve_project
+                label = ProcessMonitor._project_label
+
+                # --project: absolute, relative to cwd, ~, bare (= @.), explicit @.
+                @test resolve("julia --project=$foo -e 1", "/", env, "1.12.6") == foo
+                @test resolve("julia --project=Foo -e 1", home, env, "1.12.6") == foo
+                @test resolve("julia --project=Foo/ -e 1", home, env, "1.12.6") == foo
+                @test resolve("julia --project=~/Bar -e 1", "/", env, "1.12.6") == bar
+                @test resolve("julia --project -e 1", deep, env, "1.12.6") == foo
+                @test resolve("julia --project=@. -e 1", bar, env, "1.12.6") == bar
+                # a project file path names its directory; a missing dir is taken as is
+                @test resolve("julia --project=$foo/Project.toml", "/", env, "1.12.6") == foo
+                @test resolve("julia --project=$home/New -e 1", "/", env, "1.12.6") ==
+                    joinpath(home, "New")
+                # named environments come from the depot
+                @test resolve("julia --project=@v1.12 -e 1", "/", env, "1.12.6") == v112
+                @test resolve("julia --project=@other -e 1", "/", env, "1.12.6") ==
+                    joinpath(depot, "environments", "other")
+                # JULIA_PROJECT is the fallback; an empty value counts as unset
+                @test resolve("julia -e 1", "/", ["JULIA_PROJECT=$foo"; env], "1.12.6") == foo
+                @test resolve("julia -e 1", deep, ["JULIA_PROJECT=@."; env], "1.12.6") == foo
+                @test resolve("julia -e 1", bar, ["JULIA_PROJECT="; env], "1.12.6") ==
+                    joinpath(depot, "environments", "v1.12")
+                @test resolve("julia --project=Bar -e 1", home, ["JULIA_PROJECT=$foo"; env],
+                    "1.12.6") == bar
+                # nothing set, or @. finding nothing, lands on the default environment
+                @test resolve("julia -e 1", joinpath(home, "empty"), env, "1.12.6") == v112
+                @test resolve("julia --project -e 1", joinpath(home, "empty"), env, "1.12") ==
+                    v112
+                @test resolve("julia -e 1", joinpath(home, "empty"), env, "1.11.0") ==
+                    joinpath(depot, "environments", "v1.11")
+                # ...unless the version is unknown, or JULIA_LOAD_PATH says otherwise
+                @test resolve("julia -e 1", joinpath(home, "empty"), env, "dev") == ""
+                @test resolve("julia -e 1", joinpath(home, "empty"), env, "") == ""
+                @test resolve("julia -e 1", "/", ["JULIA_LOAD_PATH=$bar:@stdlib"; env],
+                    "1.12.6") == bar
+                @test resolve("julia -e 1", "/", ["JULIA_LOAD_PATH=@stdlib:"; env],
+                    "1.12.6") == v112
+                # a load-path directory without a project file is not the active project
+                @test resolve("julia -e 1", "/", ["JULIA_LOAD_PATH=$home/empty"; env],
+                    "1.12.6") == ""
+                # @. walking stops at $HOME, as Julia does
+                touch(joinpath(home, "Project.toml"))
+                @test resolve("julia --project -e 1", joinpath(home, "empty"), env, "1.12.6") ==
+                    home
+                # without a cwd, relative and @. projects cannot be placed
+                @test resolve("julia --project -e 1", "", env, "1.12.6") == v112
+                @test resolve("julia --project=Foo -e 1", "", env, "1.12.6") == v112
+                # no HOME: no ~ expansion and no default depot
+                @test resolve("julia --project=~/Foo -e 1", "/", String[], "1.12.6") == ""
+                @test resolve("julia -e 1", "/", String[], "1.12.6") == ""
+
+                @test label(foo) == "Foo"
+                @test label(v112) == "@v1.12"
+                @test label("") == ""
+            end
+
+            # a precompile worker (no --project, load path over stdin) reports its Julia
+            # parent's project; other children resolve on their own
+            let snap = ProcessMonitor.Snapshot(), parent = 900_000_001, worker = 900_000_002,
+                child = 900_000_003
+                for pid in (parent, worker, child)
+                    snap.name[pid] = "julia"
+                    snap.start[pid] = 1.0e9
+                end
+                snap.cmd[parent] = "julia --project=/x/Foo -e 1"
+                snap.cmd[worker] = "julia --output-ji /d/compiled/v1.12/Bar/jl_1.ji -"
+                snap.cmd[child] = "julia --project=/x/Baz -e 1"
+                snap.ppid[worker] = parent
+                snap.ppid[child] = parent
+                @test ProcessMonitor._project_dir(snap, parent) == "/x/Foo"
+                @test ProcessMonitor._project_dir(snap, worker) == "/x/Foo"
+                @test ProcessMonitor._project_dir(snap, child) == "/x/Baz"
+                # the cache is keyed on start time and pruned to the live process table
+                @test haskey(ProcessMonitor._PROJECTS, worker)
+                snap.start[worker] = 2.0e9
+                snap.cmd[parent] = "julia --project=/x/Qux -e 1"
+                snap.start[parent] = 2.0e9
+                @test ProcessMonitor._project_dir(snap, worker) == "/x/Qux"
+                ProcessMonitor._prune_projects!(snap)
+                @test !haskey(ProcessMonitor._PROJECTS, worker)
+            end
+
+            # our own row resolves to the test environment, and the detail pane shows it
+            let snap = ProcessMonitor._snapshot(full=true), self = Int(getpid())
+                dir = ProcessMonitor._project_dir(snap, self)
+                @test dir == dirname(Base.active_project())
+                @test !isempty(ProcessMonitor._project_label(dir))
+                @test ProcessMonitor._cwd(self) == pwd()
+                @test ProcessMonitor._getenv(ProcessMonitor._environ(self), "HOME") == homedir()
+                @test ProcessMonitor._getenv(ProcessMonitor._environ(self), "NO_SUCH_VAR_X") === nothing
+            end
+
             # start time and state are captured for ourselves
             @test 0 < get(snap.start, self, 0.0) <= time()
             @test get(snap.state, self, ' ') in ('R', 'S', 'I')
