@@ -523,5 +523,6 @@ for f in (:cpu_time, :rss, :thread_count, :info)
 end
 
 include("top.jl")
+include("main.jl")
 
 end # module
