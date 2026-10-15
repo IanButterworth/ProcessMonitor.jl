@@ -93,7 +93,9 @@ An `htop`-like view with some things `htop` doesn't have:
   startup — `--project`, then `JULIA_PROJECT`, then the load path, with `@.` walked up
   from the process's working directory and `@v1.12`-style depot environments named as
   such — and precompile workers, which get their load path over stdin, report their
-  parent's. The detail pane shows the full project directory. A header rollup totals
+  parent's. This is the startup project: a later `Pkg.activate` is not visible, and a
+  relative `--project` or `@.` is resolved against the working directory when jtop first
+  sees the process. The detail pane shows the full project directory. A header rollup totals
   Julia's CPU, memory and threads across the machine; `j` filters to Julia processes
   only; and `P` asks a Julia process to print a one-shot profile to its stderr
   (`SIGUSR1`/`SIGINFO`). Handy for watching a test suite, `Distributed` workers, or

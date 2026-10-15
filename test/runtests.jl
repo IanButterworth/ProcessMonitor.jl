@@ -335,9 +335,61 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
                 @test resolve("julia --project=~/Foo -e 1", "/", String[], "1.12.6") == ""
                 @test resolve("julia -e 1", "/", String[], "1.12.6") == ""
 
+                # an empty --project= means no project, and JULIA_PROJECT is not consulted
+                @test resolve("julia --project= -e 1", "/", ["JULIA_PROJECT=$foo"; env],
+                    "1.12.6") == v112
+                # only Julia's own options count, not the script's or code in -e
+                @test resolve("julia script.jl --project=$foo", "/", env, "1.12.6") == v112
+                @test resolve("julia -e using Foo; f(\"--project=$foo\")", "/", env,
+                    "1.12.6") == v112
+                @test resolve("julia -O3 --eval 1 -t 2 --project=$foo x.jl", "/", env,
+                    "1.12.6") == foo
+                @test resolve("julia +1.12 --project=$foo", "/", env, "1.12.6") == foo
+                @test resolve("julia script.jl", "/", ["JULIA_PROJECT=$foo"; env],
+                    "1.12.6") == foo
+                # projects that depend on the script or a temp dir are shown as written
+                for p in ("@script", "@script/..", "@temp", "@stdlib")
+                    @test resolve("julia --project=$p x.jl", "/", env, "1.12.6") == p
+                    @test label(p) == p
+                end
+                @test resolve("julia x.jl", "/", ["JULIA_LOAD_PATH=@stdlib:@script:@"; env],
+                    "1.12.6") == "@script"
+                # an empty JULIA_LOAD_PATH means no load path at all
+                @test resolve("julia -e 1", "/", ["JULIA_LOAD_PATH="; env], "1.12.6") == ""
+                # a named environment needs a project file to be found in a later depot
+                depot2 = joinpath(home, "depot2")
+                mkpath(joinpath(depot, "environments", "shared"))
+                mkpath(joinpath(depot2, "environments", "shared"))
+                touch(joinpath(depot2, "environments", "shared", "Project.toml"))
+                @test resolve("julia --project=@shared", "/",
+                    ["HOME=$home", "JULIA_DEPOT_PATH=$depot:$depot2"], "1.12.6") ==
+                    joinpath(depot2, "environments", "shared")
+                # empty JULIA_DEPOT_PATH entries changed meaning in 1.11
+                depots = ProcessMonitor._depots
+                user = joinpath(home, ".julia")
+                @test depots(["HOME=$home"], home, "1.12.6") == [user]
+                @test depots(["HOME=$home", "JULIA_DEPOT_PATH="], home, "1.12.6") == String[]
+                @test depots(["HOME=$home", "JULIA_DEPOT_PATH=$depot:"], home, "1.12.6") ==
+                    [depot]
+                @test depots(["HOME=$home", "JULIA_DEPOT_PATH=:$depot"], home, "1.12.6") ==
+                    [user, depot]
+                @test depots(["HOME=$home", "JULIA_DEPOT_PATH=:"], home, "dev") == [user]
+                @test depots(["HOME=$home", "JULIA_DEPOT_PATH=$depot:"], home, "1.10.5") ==
+                    [depot, user]
+
                 @test label(foo) == "Foo"
                 @test label(v112) == "@v1.12"
                 @test label("") == ""
+            end
+
+            # macOS argv/environment buffer: empty args still count towards argc, and the
+            # environment ends at the first empty string
+            let buf = vcat(reinterpret(UInt8, Int32[4]), codeunits("/bin/julia"), zeros(UInt8, 3),
+                    codeunits("julia\0-e\0\0x\0HOME=/h\0A=1\0\0executable_path=/bin/julia\0"))
+                @test ProcessMonitor._parse_procargs(buf, false) == (["julia", "-e", "x"], String[])
+                @test ProcessMonitor._parse_procargs(buf, true) ==
+                    (["julia", "-e", "x"], ["HOME=/h", "A=1"])
+                @test ProcessMonitor._parse_procargs(UInt8[1, 0], true) == (String[], String[])
             end
 
             # a precompile worker (no --project, load path over stdin) reports its Julia
@@ -356,6 +408,12 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
                 @test ProcessMonitor._project_dir(snap, parent) == "/x/Foo"
                 @test ProcessMonitor._project_dir(snap, worker) == "/x/Foo"
                 @test ProcessMonitor._project_dir(snap, child) == "/x/Baz"
+                # the cache tolerates start-time jitter but not a new command line
+                snap.start[child] = 1.0e9 + 1
+                snap.cmd[parent] = "julia --project=/x/Changed -e 1"
+                @test ProcessMonitor._project_dir(snap, child) == "/x/Baz"
+                snap.cmd[child] = "julia --project=/x/Exec -e 1"
+                @test ProcessMonitor._project_dir(snap, child) == "/x/Exec"
                 # the cache is keyed on start time and pruned to the live process table
                 @test haskey(ProcessMonitor._PROJECTS, worker)
                 snap.start[worker] = 2.0e9
@@ -366,7 +424,9 @@ const IDLE_PARENT = raw"""run(`$(Base.julia_cmd()) --startup-file=no -e "while t
                 @test !haskey(ProcessMonitor._PROJECTS, worker)
             end
 
-            # our own row resolves to the test environment, and the detail pane shows it
+            # our own row resolves to the test environment (cwd and environment are only
+            # readable on Linux and macOS)
+            (Sys.islinux() || Sys.isapple()) &&
             let snap = ProcessMonitor._snapshot(full=true), self = Int(getpid())
                 dir = ProcessMonitor._project_dir(snap, self)
                 @test dir == dirname(Base.active_project())

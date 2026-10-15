@@ -204,11 +204,9 @@ function _snapshot_libproc(full::Bool = false)
     return s
 end
 
-# macOS: recover a process's argv and environment via sysctl KERN_PROCARGS2 (own-uid
-# processes only). The buffer holds an int32 argc, the exec path, NUL padding, argc
-# NUL-separated args, and then the NUL-separated environment strings (followed by a few
-# "key=value" strings the loader adds, e.g. executable_path=, which are harmless here).
-function _procargs_apple(pid::Int)
+# macOS: recover a process's argv, and its environment when `env` is set, via sysctl
+# KERN_PROCARGS2 (own-uid processes only).
+function _procargs_apple(pid::Int; env::Bool = false)
     mib = Cint[1, 49, pid]  # CTL_KERN, KERN_PROCARGS2, pid
     sz = Ref{Csize_t}(0)
     ccall(:sysctl, Cint, (Ptr{Cint}, Cuint, Ptr{Cvoid}, Ptr{Csize_t}, Ptr{Cvoid}, Csize_t),
@@ -216,20 +214,30 @@ function _procargs_apple(pid::Int)
     buf = zeros(UInt8, sz[])
     ccall(:sysctl, Cint, (Ptr{Cint}, Cuint, Ptr{Cvoid}, Ptr{Csize_t}, Ptr{Cvoid}, Csize_t),
         mib, 3, buf, sz, C_NULL, 0) == 0 || return String[], String[]
-    length(buf) >= 4 || return String[], String[]
+    return _parse_procargs(buf, env)
+end
+
+# The buffer holds an int32 argc, the exec path, NUL padding, argc NUL-terminated args,
+# then the environment strings up to an empty one (the loader's own strings follow).
+# Empty args count towards argc but are left out of the result.
+function _parse_procargs(buf::Vector{UInt8}, withenv::Bool)
+    args = String[]
+    env = String[]
+    length(buf) >= 4 || return args, env
     argc = reinterpret(Int32, buf[1:4])[1]
     i = 5
     while i <= length(buf) && buf[i] != 0x00; i += 1; end  # exec path
     while i <= length(buf) && buf[i] == 0x00; i += 1; end  # padding
-    args = String[]
-    env = String[]
     n = 0
     while i <= length(buf)
         j = i
         while j <= length(buf) && buf[j] != 0x00; j += 1; end
-        if j > i
+        if n < argc
             n += 1
-            push!(n <= argc ? args : env, String(buf[i:j-1]))
+            j > i && push!(args, String(buf[i:j-1]))
+        else
+            (withenv && j > i) || break
+            push!(env, String(buf[i:j-1]))
         end
         i = j + 1
     end
@@ -269,7 +277,7 @@ function _environ(pid::Int)
         end
         return String[String(e) for e in eachsplit(raw, '\0') if !isempty(e)]
     elseif Sys.isapple()
-        _, env = _procargs_apple(pid)
+        _, env = _procargs_apple(pid; env = true)
         return env
     end
     return String[]
