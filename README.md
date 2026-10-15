@@ -123,6 +123,21 @@ the first row returns to the unselected position.
 `top(io)` renders a single non-interactive frame to any `IO` (for logging or CI
 diagnostics); use `tree=true` for the tree form or `graphs=true` for the signal view.
 
+## `jtop` as a Pkg app
+
+On Julia 1.12 or newer, Pkg can install `jtop` as a command in `~/.julia/bin` (add that
+directory to your `PATH`):
+
+```julia
+pkg> app add ProcessMonitor
+```
+
+```sh
+jtop --tree
+```
+
+This runs in a normal Julia session, so it starts slower than the binary below.
+
 ## `jtop`: a standalone executable
 
 The view compiles to a small self-contained binary with `juliac --trim`, which starts
