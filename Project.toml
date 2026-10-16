@@ -3,6 +3,9 @@ uuid = "4131f68c-4ce9-42e2-8e2e-eec1ce550ab1"
 authors = ["Ian Butterworth <i.r.butterworth@gmail.com>"]
 version = "0.1.2"
 
+[workspace]
+projects = ["juliac"]
+
 [deps]
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Unicode = "4ec0a83e-493e-50e2-b9ac-8f72acf5a8f5"
@@ -13,6 +16,7 @@ Unicode = "1"
 julia = "1.10"
 
 [apps.jtop]
+build = "juliac"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
