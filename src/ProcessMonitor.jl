@@ -197,37 +197,100 @@ function _snapshot_libproc(full::Bool = false)
         if full
             n = ccall(:proc_pidpath, Cint, (Cint, Ptr{UInt8}, UInt32), pid, pb, length(pb))
             n > 0 && (s.exe[pid] = String(pb[1:n]))
-            args = _procargs_apple(pid)
+            args, _ = _procargs_apple(pid)
             isempty(args) || (s.cmd[pid] = join(args, ' '))
         end
     end
     return s
 end
 
-# macOS: recover a process's argv via sysctl KERN_PROCARGS2 (own-uid processes only).
-# The buffer holds an int32 argc, the exec path, NUL padding, then argc NUL-separated args.
-function _procargs_apple(pid::Int)
+# macOS: recover a process's argv, and its environment when `env` is set, via sysctl
+# KERN_PROCARGS2 (own-uid processes only).
+function _procargs_apple(pid::Int; env::Bool = false)
     mib = Cint[1, 49, pid]  # CTL_KERN, KERN_PROCARGS2, pid
     sz = Ref{Csize_t}(0)
     ccall(:sysctl, Cint, (Ptr{Cint}, Cuint, Ptr{Cvoid}, Ptr{Csize_t}, Ptr{Cvoid}, Csize_t),
-        mib, 3, C_NULL, sz, C_NULL, 0) == 0 || return String[]
+        mib, 3, C_NULL, sz, C_NULL, 0) == 0 || return String[], String[]
     buf = zeros(UInt8, sz[])
     ccall(:sysctl, Cint, (Ptr{Cint}, Cuint, Ptr{Cvoid}, Ptr{Csize_t}, Ptr{Cvoid}, Csize_t),
-        mib, 3, buf, sz, C_NULL, 0) == 0 || return String[]
-    length(buf) >= 4 || return String[]
+        mib, 3, buf, sz, C_NULL, 0) == 0 || return String[], String[]
+    return _parse_procargs(buf, env)
+end
+
+# The buffer holds an int32 argc, the exec path, NUL padding, argc NUL-terminated args,
+# then the environment strings up to an empty one (the loader's own strings follow).
+# Empty args count towards argc but are left out of the result.
+function _parse_procargs(buf::Vector{UInt8}, withenv::Bool)
+    args = String[]
+    env = String[]
+    length(buf) >= 4 || return args, env
     argc = reinterpret(Int32, buf[1:4])[1]
     i = 5
     while i <= length(buf) && buf[i] != 0x00; i += 1; end  # exec path
     while i <= length(buf) && buf[i] == 0x00; i += 1; end  # padding
-    args = String[]
-    for _ in 1:argc
+    n = 0
+    while i <= length(buf)
         j = i
         while j <= length(buf) && buf[j] != 0x00; j += 1; end
-        j > i && push!(args, String(buf[i:j-1]))
+        if n < argc
+            n += 1
+            j > i && push!(args, String(buf[i:j-1]))
+        else
+            (withenv && j > i) || break
+            push!(env, String(buf[i:j-1]))
+        end
         i = j + 1
-        i > length(buf) && break
     end
-    return args
+    return args, env
+end
+
+# A process's current working directory, or "" when unknown or not permitted (other
+# users' processes). macOS: proc_pidinfo(PROC_PIDVNODEPATHINFO) fills two vnode_info_path
+# structs (cwd, then root), each a 152-byte vnode_info followed by a MAXPATHLEN path.
+function _cwd(pid::Int)
+    if Sys.islinux()
+        return try
+            readlink("/proc/$pid/cwd")
+        catch
+            ""
+        end
+    elseif Sys.isapple()
+        buf = zeros(UInt8, 2 * (152 + 1024))
+        n = ccall(:proc_pidinfo, Cint, (Cint, Cint, UInt64, Ptr{Cvoid}, Cint),
+            pid, 9, 0, buf, length(buf))
+        n >= 152 + 1024 || return ""
+        i = 153
+        j = i
+        while j < 153 + 1024 && buf[j] != 0x00; j += 1; end
+        return String(buf[i:j-1])
+    end
+    return ""
+end
+
+# A process's environment as "KEY=VALUE" strings; empty when unknown or not permitted.
+function _environ(pid::Int)
+    if Sys.islinux()
+        raw = try
+            read("/proc/$pid/environ", String)
+        catch
+            return String[]
+        end
+        return String[String(e) for e in eachsplit(raw, '\0') if !isempty(e)]
+    elseif Sys.isapple()
+        _, env = _procargs_apple(pid; env = true)
+        return env
+    end
+    return String[]
+end
+
+# Look up KEY in an `_environ` result; `nothing` when unset.
+function _getenv(env::Vector{String}, key::String)
+    for e in env
+        if startswith(e, key) && length(e) > length(key) && e[length(key) + 1] == '='
+            return e[length(key) + 2:end]
+        end
+    end
+    return nothing
 end
 
 # BSD: one `ps` snapshot of the full process table. `nlwp` (thread count) is not
