@@ -1,0 +1,6 @@
+[deps]
+JuliaC = "acedd4c2-ced6-4a15-accc-2607eb759ba2"
+ProcessMonitor = "4131f68c-4ce9-42e2-8e2e-eec1ce550ab1"
+
+[compat]
+JuliaC = "0.3"

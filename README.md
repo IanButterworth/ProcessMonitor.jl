@@ -143,7 +143,10 @@ pkg> app add ProcessMonitor
 jtop --tree
 ```
 
-This runs in a normal Julia session, so it starts slower than the binary below.
+This runs in a normal Julia session, so it starts slower than the binary below. With a
+Pkg that supports trimmed apps, `app add` instead builds that binary for you with the
+JuliaC from `juliac/Project.toml` (named by `build = "juliac"`), and the command runs it,
+falling back to Julia if the build fails.
 
 ## `jtop`: a standalone executable
 
